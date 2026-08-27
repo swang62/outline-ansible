@@ -6,26 +6,42 @@ This provisions an AWS EC2 instance with:
 - A 10 GiB `gp3` root volume
 - Inbound TCP ports 22, 80, and 443
 - Key-only SSH access
-- A dynamic Ansible inventory to track IP
 
 ## Setup
 
-Global settings for Terraform and Ansible live in `terraform/global.auto.tfvars.json`. Terraform and Ansible use your default AWS CLI credentials.
+Global settings live in `terraform/global.auto.tfvars.json`. AWS CLI, Terraform, and Ansible must be pre-installed.
 
 ```sh
+# Install dependencies
 ansible-galaxy collection install -r requirements.yml
 ansible-playbook ansible/playbook.yml
+
+# Test the server
 ansible-inventory --list
 ansible all -m ping
 ```
 
-### Optional settings
+## Credentials
 
-- To restrict SSH, set `ssh_ingress_cidrs` to one or more trusted CIDRs
-- AWS region can also be updated in `terraform/global.auto.tfvars.json`
-- Set the API token ENV and zone/DNS variables for optional Cloudflare DDNS
+### AWS credentials
+
+Install and configure the AWS CLI with admin credentials:
 
 ```sh
-export CLOUDFLARE_API_TOKEN='your-token'
-ansible-playbook ansible/playbook.yml
+aws configure
+aws sts get-caller-identity
 ```
+
+### SSH key
+
+Create the local key pair before you run the playbook:
+
+```sh
+ssh-keygen -t ed25519 -f ~/.ssh/outline-ec2 -C outline-ec2
+chmod 600 ~/.ssh/outline-ec2
+```
+
+## Optional settings
+
+- To restrict SSH, set `ssh_ingress_cidrs` to your own IP or trusted CIDRs
+- Set the CLOUDFLARE_API_TOKEN environmental variable and terraform global vars for optional Cloudflare DDNS to always point at your server's dynamic IP
