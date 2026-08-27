@@ -84,6 +84,10 @@ resource "aws_instance" "instance" {
   tags = {
     Name = var.instance_name
   }
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
 }
 
 resource "aws_ec2_instance_state" "instance" {

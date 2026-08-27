@@ -93,15 +93,19 @@
         name: dnf-automatic
         state: present
 
-    - name: Configure automatic security updates
+    - name: Apply only security updates automatically
       community.general.ini_file:
         path: /etc/dnf/automatic.conf
         section: commands
-        option: "{{ item.option }}"
-        value: "{{ item.value }}"
-      loop:
-        - { option: upgrade_type, value: security }
-        - { option: apply_updates, value: "yes" }
+        option: upgrade_type
+        value: default
+
+    - name: Install updates automatically, not just download
+      community.general.ini_file:
+        path: /etc/dnf/automatic.conf
+        section: commands
+        option: apply_updates
+        value: "yes"
 
     - name: Enable dnf-automatic timer
       ansible.builtin.systemd:
