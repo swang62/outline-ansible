@@ -1,0 +1,14 @@
+---
+plugin: amazon.aws.aws_ec2
+regions:
+  - "{{ (lookup('file', lookup('env', 'PWD') + '/terraform/global.auto.tfvars.json') | from_json).aws_region }}"
+filters:
+  tag:Name: outline-ec2
+  instance-state-name: running
+hostnames:
+  - ip-address
+hostvars_prefix: aws_
+compose:
+  ec2_tags: aws_ec2_tags
+  ansible_user: "'root'"
+  ansible_private_key_file: "'~/.ssh/outline-ec2'"
