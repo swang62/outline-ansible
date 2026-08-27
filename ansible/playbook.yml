@@ -36,7 +36,7 @@
       no_log: true
       when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
 
-- name: Configure SSH
+- name: Configure server
   hosts: aws_ec2
   vars:
     ansible_user: ec2-user
@@ -87,6 +87,49 @@
           alias ls='command ls -aHF'
         state: present
         create: true
+
+    - name: Install dnf-automatic
+      ansible.builtin.package:
+        name: dnf-automatic
+        state: present
+
+    - name: Configure automatic security updates
+      community.general.ini_file:
+        path: /etc/dnf/automatic.conf
+        section: commands
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+      loop:
+        - { option: upgrade_type, value: security }
+        - { option: apply_updates, value: "yes" }
+
+    - name: Enable dnf-automatic timer
+      ansible.builtin.systemd:
+        name: dnf-automatic.timer
+        state: started
+        enabled: true
+
+    - name: Install boot-time update service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/dnf-update-boot.service
+        content: |
+          [Unit]
+          Description=Full dnf update at boot
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/dnf -y update
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable boot-time update service
+      ansible.builtin.systemd:
+        name: dnf-update-boot.service
+        enabled: true
+        daemon_reload: true
 
   handlers:
     - name: Restart sshd

@@ -93,54 +93,20 @@ resource "aws_ec2_instance_state" "instance" {
 
 resource "aws_cloudwatch_metric_alarm" "low_cpu" {
   alarm_name          = "awsec2-${aws_instance.instance.id}-LowActivity"
-  alarm_description   = "Stops instance ${aws_instance.instance.id} when CPU is below 1.5% and maximum egress is below 1 MB/s for 4 consecutive 15-minute periods."
+  alarm_description   = "Stops instance ${aws_instance.instance.id} when average CPU is below 1.5% for four consecutive 15-minute periods."
   evaluation_periods  = 4
   datapoints_to_alarm = 4
-  threshold           = 1
-  comparison_operator = "GreaterThanOrEqualToThreshold"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 900
+  statistic           = "Average"
+  threshold           = 1.5
+  comparison_operator = "LessThanThreshold"
   treat_missing_data  = "notBreaching"
 
-  metric_query {
-    id          = "low_activity"
-    expression  = "IF(cpu < 1.5 AND egress_rate < 1000000, 1, 0)"
-    label       = "Low CPU and network egress"
-    return_data = true
+  dimensions = {
+    InstanceId = aws_instance.instance.id
   }
 
-  metric_query {
-    id = "cpu"
-
-    metric {
-      metric_name = "CPUUtilization"
-      namespace   = "AWS/EC2"
-      period      = 900
-      stat        = "Average"
-
-      dimensions = {
-        InstanceId = aws_instance.instance.id
-      }
-    }
-  }
-
-  metric_query {
-    id          = "egress_rate"
-    expression  = "egress / PERIOD(egress)"
-    label       = "Maximum egress rate"
-    return_data = false
-  }
-
-  metric_query {
-    id = "egress"
-
-    metric {
-      metric_name = "NetworkOut"
-      namespace   = "AWS/EC2"
-      period      = 900
-      stat        = "Maximum"
-
-      dimensions = {
-        InstanceId = aws_instance.instance.id
-      }
-    }
-  }
+  alarm_actions = ["arn:aws:automate:${var.aws_region}:ec2:stop"]
 }
