@@ -1,11 +1,14 @@
 # Outline Server with Ansible/Terraform
 
-This provisions an AWS EC2 instance with:
+This provisions an AWS EC2 instance with Outline Server VPN:
 
 - Amazon Linux AMI
 - A 10 GiB `gp3` root volume
-- Inbound TCP ports 22, 80, and 443
+- Inbound ports 22, 80, and 443
 - Key-only SSH access
+- `quay.io/outline/shadowbox:stable` container
+- Access keys on port 443
+- Management API on port 50443
 
 ## Setup
 
@@ -14,12 +17,19 @@ Global settings live in `terraform/global.auto.tfvars.json`. AWS CLI, Terraform,
 ```sh
 # Install dependencies
 ansible-galaxy collection install -r requirements.yml
-ansible-playbook ansible/playbook.yml
 
-# Test the server
+# Provision, configure, and deploy the server (Terraform, DNS, SSH, OS, fail2ban, Docker, shadowbox, access keys)
+ansible-playbook ansible/setup.yml
+
+# Wake the server after the auto-stop alarm fired (start, DNS, health, deploy)
+ansible-playbook ansible/start.yml
+
+# Test the server if up and running, stopped servers will fail discovery
 ansible-inventory --list
 ansible all -m ping
 ```
+
+Both playbooks are idempotent and safe to re-run. Shared variables live in `ansible/group_vars/`; the Outline API prefix and ports are set there.
 
 ## Credentials
 
@@ -41,7 +51,10 @@ ssh-keygen -t ed25519 -f ~/.ssh/outline-ec2 -C outline-ec2
 chmod 600 ~/.ssh/outline-ec2
 ```
 
+### TLS Certificates
+
+The self-signed TLS certificate is generated on your machine and uploaded to the server. Files live in `files/outline/` and are reused on every future run.
+
 ## Optional settings
 
-- To restrict SSH, set `ssh_ingress_cidrs` to your own IP or trusted CIDRs
-- Set the CLOUDFLARE_API_TOKEN environmental variable and terraform global vars for optional Cloudflare DDNS to always point at your server's dynamic IP
+- Set the CLOUDFLARE_API_TOKEN environmental variable and terraform vars for Cloudflare DDNS

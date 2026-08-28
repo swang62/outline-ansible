@@ -1,0 +1,97 @@
+---
+- name: Wake Outline server
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_dir: "{{ lookup('env', 'PWD') }}/terraform"
+    terraform_vars:
+      - aws_region
+      - instance_name
+      - instance_type
+      - ssh_public_key_path
+      - cloudflare_zone
+      - cloudflare_dns_name
+  tasks:
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ terraform_dir }}/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Start instance via terraform
+      cloud.terraform.terraform:
+        project_path: "{{ terraform_dir }}"
+        state: present
+        force_init: true
+        complex_vars: true
+        variables: "{{ global_vars | dict2items | selectattr('key', 'in', terraform_vars) | items2dict }}"
+      register: tf_result
+
+    - name: Refresh inventory
+      ansible.builtin.meta: refresh_inventory
+
+    - name: Update cloudflare DNS
+      community.general.cloudflare_dns:
+        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+        zone: "{{ global_vars.cloudflare_zone }}"
+        record: "{{ global_vars.cloudflare_dns_name }}"
+        type: A
+        value: "{{ hostvars[groups['aws_ec2'][0]].aws_public_ip_address }}"
+        ttl: 60
+        proxied: false
+        solo: true
+        state: present
+      no_log: true
+      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+
+    - name: Update cloudflare IPv6 DNS
+      community.general.cloudflare_dns:
+        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+        zone: "{{ global_vars.cloudflare_zone }}"
+        record: "{{ global_vars.cloudflare_dns_name }}"
+        type: AAAA
+        value: "{{ hostvars[groups['aws_ec2'][0]].aws_ipv6_address }}"
+        ttl: 60
+        proxied: false
+        solo: true
+        state: present
+      no_log: true
+      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+
+- name: Verify server is online
+  hosts: aws_ec2
+  become: true
+  gather_facts: false
+  vars:
+    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    terraform_dir: "{{ lookup('env', 'PWD') }}/terraform"
+  tasks:
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        sleep: 5
+
+    - name: Check shadowbox container status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{{ '{{' }}.State.Status{{ '}}' }}"
+          - shadowbox
+      register: shadowbox_status
+      changed_when: false
+
+    - name: Confirm shadowbox is running
+      ansible.builtin.assert:
+        that:
+          - shadowbox_status.stdout == "running"
+        success_msg: "Server online, shadowbox running"
+
+    - name: Save current server addresses
+      ansible.builtin.copy:
+        dest: "{{ local_outline_dir }}/addresses.txt"
+        mode: "0644"
+        content: "{{ aws_public_ip_address }} {{ aws_ipv6_address }}\n"
+      delegate_to: localhost
+      become: false

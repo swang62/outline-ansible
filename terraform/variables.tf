@@ -16,11 +16,6 @@ variable "ssh_public_key_path" {
   type        = string
 }
 
-variable "ssh_ingress_cidrs" {
-  description = "CIDRs allowed to reach SSH. Restrict these to trusted IPs when possible."
-  type        = list(string)
-}
-
 variable "cloudflare_zone" {
   type = string
 }

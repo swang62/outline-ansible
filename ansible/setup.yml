@@ -1,0 +1,485 @@
+---
+- name: Provision EC2, Cloudwatch, and Cloudflare DNS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_dir: "{{ lookup('env', 'PWD') }}/terraform"
+    terraform_vars:
+      - aws_region
+      - instance_name
+      - instance_type
+      - ssh_public_key_path
+      - cloudflare_zone
+      - cloudflare_dns_name
+  tasks:
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ terraform_dir }}/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Apply terraform configuration
+      cloud.terraform.terraform:
+        project_path: "{{ terraform_dir }}"
+        state: present
+        force_init: true
+        complex_vars: true
+        variables: "{{ global_vars | dict2items | selectattr('key', 'in', terraform_vars) | items2dict }}"
+      register: tf_result
+
+    - name: Refresh inventory
+      ansible.builtin.meta: refresh_inventory
+
+    - name: Update cloudflare DNS
+      community.general.cloudflare_dns:
+        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+        zone: "{{ global_vars.cloudflare_zone }}"
+        record: "{{ global_vars.cloudflare_dns_name }}"
+        type: A
+        value: "{{ hostvars[groups['aws_ec2'][0]].aws_public_ip_address }}"
+        ttl: 60
+        proxied: false
+        solo: true
+        state: present
+      no_log: true
+      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+
+    - name: Update cloudflare IPv6 DNS
+      community.general.cloudflare_dns:
+        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+        zone: "{{ global_vars.cloudflare_zone }}"
+        record: "{{ global_vars.cloudflare_dns_name }}"
+        type: AAAA
+        value: "{{ hostvars[groups['aws_ec2'][0]].aws_ipv6_address }}"
+        ttl: 60
+        proxied: false
+        solo: true
+        state: present
+      no_log: true
+      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+
+- name: Configure server
+  hosts: aws_ec2
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+
+    - name: Configure key-only SSH
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-key-only.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          AllowAgentForwarding no
+          AllowTcpForwarding yes
+          AllowUsers ec2-user
+          ChallengeResponseAuthentication no
+          ClientAliveCountMax 600
+          ClientAliveInterval 30
+          KbdInteractiveAuthentication no
+          MaxAuthTries 3
+          PasswordAuthentication no
+          PermitEmptyPasswords no
+          PermitRootLogin no
+          PermitUserEnvironment no
+          PubkeyAuthentication yes
+          X11Forwarding no
+      notify: Apply services
+
+    - name: Add shell aliases
+      ansible.builtin.blockinfile:
+        path: /home/ec2-user/.bashrc
+        owner: ec2-user
+        group: ec2-user
+        marker: "# {mark} Ansible managed shell aliases"
+        block: |
+          alias ll='ls -alHF'
+          alias ls='command ls -aHF'
+        state: present
+        create: true
+
+    - name: Install boot-time update service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/dnf-update-boot.service
+        content: |
+          [Unit]
+          Description=Full dnf update at boot
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/dnf -y update
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable BBR congestion control
+      ansible.posix.sysctl:
+        name: net.ipv4.tcp_congestion_control
+        value: bbr
+        sysctl_file: /etc/sysctl.d/99-outline.conf
+        reload: true
+
+    - name: Enable fq queueing discipline
+      ansible.posix.sysctl:
+        name: net.core.default_qdisc
+        value: fq
+        sysctl_file: /etc/sysctl.d/99-outline.conf
+        reload: true
+
+    - name: Install fail2ban
+      ansible.builtin.package:
+        name: fail2ban
+        state: present
+
+    - name: Configure fail2ban jail
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [sshd]
+          enabled = true
+          port = 22
+          filter = sshd
+          backend = systemd
+          maxretry = 5
+          findtime = 10m
+          bantime = 1h
+          bantime.increment = true
+          bantime.maxtime = 1d
+          banaction = firewallcmd-ipset
+      notify: Apply services
+
+  handlers:
+    - name: Apply services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        daemon_reload: true
+        enabled: true
+        state: restarted
+      loop:
+        - dnf-update-boot.service
+        - sshd
+        - fail2ban
+
+- name: Generate Outline TLS certificate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
+    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+  tasks:
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ lookup('env', 'PWD') }}/terraform/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Create local Outline directory
+      ansible.builtin.file:
+        path: "{{ local_outline_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Generate Outline API prefix
+      ansible.builtin.shell:
+        cmd: "head -c 16 /dev/urandom | base64 | tr '/+' '_-' | tr -d '=' > '{{ local_outline_dir }}/api-prefix'"
+        creates: "{{ local_outline_dir }}/api-prefix"
+
+    - name: Generate access key password
+      ansible.builtin.shell:
+        cmd: "openssl rand -hex 16 > '{{ local_outline_dir }}/access-key-password.txt'"
+        creates: "{{ local_outline_dir }}/access-key-password.txt"
+
+    - name: Generate self-signed certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -nodes
+          - -days
+          - "36500"
+          - -newkey
+          - rsa:4096
+          - -subj
+          - "/CN={{ outline_hostname }}"
+          - -keyout
+          - "{{ local_outline_dir }}/shadowbox-selfsigned.key"
+          - -out
+          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+        creates: "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+
+    - name: Compute certificate SHA-256 fingerprint
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+          - -noout
+          - -sha256
+          - -fingerprint
+      register: outline_cert_fingerprint
+      changed_when: false
+
+    - name: Write Outline Manager connection file
+      ansible.builtin.copy:
+        dest: "{{ local_outline_dir }}/outline-manager.json"
+        mode: "0644"
+        content: |
+          {"apiUrl": "https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}", "certSha256": "{{ outline_cert_fingerprint.stdout.split('=')[1] | replace(':', '') }}"}
+
+    - name: Outline Manager connection JSON
+      ansible.builtin.debug:
+        msg: "{{ lookup('ansible.builtin.file', local_outline_dir + '/outline-manager.json') | from_json }}"
+
+- name: Deploy Outline server
+  hosts: aws_ec2
+  become: true
+  gather_facts: false
+  vars:
+    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
+    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+    outline_state_dir: "{{ global_vars.outline_dir }}/persisted-state"
+  tasks:
+    - name: Guard against running on localhost or an empty target
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname != 'localhost'
+          - groups['aws_ec2'] | length > 0
+        fail_msg: "Outline deploy must run on a live aws_ec2 host, not localhost and not with an empty inventory."
+        success_msg: "Deploy target is a live server: {{ inventory_hostname }}"
+
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ lookup('env', 'PWD') }}/terraform/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Install Docker
+      ansible.builtin.package:
+        name: docker
+        state: present
+
+    - name: Enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Install Docker SDK for Python
+      ansible.builtin.package:
+        name: python3-docker
+        state: present
+
+    - name: Create persistent state directory
+      ansible.builtin.file:
+        path: "{{ outline_state_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Upload TLS certificate
+      ansible.builtin.copy:
+        src: "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+        dest: "{{ outline_state_dir }}/shadowbox-selfsigned.crt"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Upload TLS key
+      ansible.builtin.copy:
+        src: "{{ local_outline_dir }}/shadowbox-selfsigned.key"
+        dest: "{{ outline_state_dir }}/shadowbox-selfsigned.key"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Write shadowbox server config
+      ansible.builtin.copy:
+        dest: "{{ outline_state_dir }}/shadowbox_server_config.json"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "portForNewAccessKeys": {{ global_vars.outline_keys_port }},
+            "hostname": "{{ outline_hostname }}",
+            "metricsEnabled": false
+          }
+
+    - name: Run shadowbox container
+      community.docker.docker_container:
+        name: shadowbox
+        image: "{{ global_vars.outline_image }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        log_driver: local
+        volumes:
+          - "{{ outline_state_dir }}:{{ outline_state_dir }}"
+        env:
+          SB_STATE_DIR: "{{ outline_state_dir }}"
+          SB_API_PORT: "{{ global_vars.outline_api_port | string }}"
+          SB_API_PREFIX: "{{ outline_api_prefix }}"
+          SB_CERTIFICATE_FILE: "{{ outline_state_dir }}/shadowbox-selfsigned.crt"
+          SB_PRIVATE_KEY_FILE: "{{ outline_state_dir }}/shadowbox-selfsigned.key"
+
+    - name: Wait for Outline API to come up
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --fail
+          - --insecure
+          - https://localhost:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+      register: outline_access_keys
+      until: outline_access_keys.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Create first access key
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --fail
+          - --insecure
+          - --request
+          - POST
+          - -H
+          - Content-Type:application/json
+          - -d
+          - '{{ {"password": lookup("ansible.builtin.file", local_outline_dir + "/access-key-password.txt") | trim} | to_json }}'
+          - https://localhost:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+      when: (outline_access_keys.stdout | from_json).accessKeys | length == 0
+
+    - name: Read access keys
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --fail
+          - --insecure
+          - https://localhost:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+      register: outline_keys_final
+      changed_when: false
+
+    - name: Save first access key URL
+      ansible.builtin.copy:
+        dest: "{{ local_outline_dir }}/access-key.txt"
+        mode: "0600"
+        content: "{{ (outline_keys_final.stdout | from_json).accessKeys[0].accessUrl }}&prefix={{ global_vars.outline_prefix }}"
+      delegate_to: localhost
+      become: false
+
+    - name: First access key URL
+      ansible.builtin.debug:
+        msg: "{{ lookup('ansible.builtin.file', local_outline_dir + '/access-key.txt') }}"
+
+    - name: Verify Outline API reachable from outside
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --fail
+          - --cacert
+          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+- name: Verify server health
+  hosts: aws_ec2
+  gather_facts: false
+  vars:
+    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
+    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+  tasks:
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ lookup('env', 'PWD') }}/terraform/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Ping server over ICMPv4
+      ansible.builtin.command:
+        argv:
+          - ping
+          - -c
+          - "4"
+          - "{{ aws_public_ip_address }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      register: health_icmp
+
+    - name: Ping server over ICMPv6
+      ansible.builtin.command:
+        argv:
+          - ping6
+          - -c
+          - "4"
+          - "{{ aws_ipv6_address }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      register: health_icmp6
+
+    - name: Ping server over SSH
+      ansible.builtin.ping:
+      register: health_ping
+
+    - name: Verify Outline API reachable from outside
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --fail
+          - --cacert
+          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      register: health_outline_api
+
+    - name: Server addresses and ping results
+      ansible.builtin.debug:
+        msg: >-
+          IPv4 {{ aws_public_ip_address }} | IPv6 {{ aws_ipv6_address }} |
+          Ping v4: {{ health_icmp.stdout_lines | select('search', 'packet loss') | first | default('no output') }} |
+          Ping v6: {{ health_icmp6.stdout_lines | select('search', 'packet loss') | first | default('no output') }}
+
+    - name: Confirm health checks passed
+      ansible.builtin.assert:
+        that:
+          - health_ping.ping == "pong"
+          - health_outline_api.rc == 0
+        success_msg: "Server healthy over SSH and Outline API is reachable"
+
+    - name: Save current server addresses
+      ansible.builtin.copy:
+        dest: "{{ lookup('env', 'PWD') }}/files/outline/addresses.txt"
+        mode: "0644"
+        content: "IPV$: {{ aws_public_ip_address }}\nIPV6: {{ aws_ipv6_address }}\n"
+      delegate_to: localhost
+      become: false

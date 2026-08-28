@@ -1,0 +1,53 @@
+---
+- name: Stop Outline server
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    terraform_dir: "{{ lookup('env', 'PWD') }}/terraform"
+  tasks:
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ terraform_dir }}/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Resolve instance id from terraform
+      ansible.builtin.shell:
+        cmd: |
+          id="$(terraform -chdir={{ terraform_dir }} output -raw instance_id 2>/dev/null)" || exit 0
+          echo "$id"
+      register: tf_instance_id
+      changed_when: false
+      failed_when: false
+
+    - name: Query instance state
+      ansible.builtin.shell:
+        cmd: |
+          id="{{ tf_instance_id.stdout | trim }}"
+          [ -z "$id" ] && exit 0
+          aws ec2 describe-instances --instance-ids "$id" --region {{ global_vars.aws_region }} --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown
+      register: instance_state
+      changed_when: false
+      failed_when: false
+
+    - name: Stop instance
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - stop-instances
+          - --instance-ids
+          - "{{ tf_instance_id.stdout | trim }}"
+          - --region
+          - "{{ global_vars.aws_region }}"
+      when:
+        - tf_instance_id.stdout | trim | length > 0
+        - instance_state.stdout | trim == 'running'
+      changed_when: true
+
+    - name: Report result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'instance ' + (tf_instance_id.stdout | trim) + ' stopped' if (tf_instance_id.stdout | trim | length > 0 and instance_state.stdout | trim == 'running')
+             else 'no instance found' if tf_instance_id.stdout | trim | length == 0
+             else 'instance ' + (tf_instance_id.stdout | trim) + ' already ' + (instance_state.stdout | trim) + ', nothing to do' }}
