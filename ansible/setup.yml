@@ -4,7 +4,7 @@
   connection: local
   gather_facts: false
   vars:
-    terraform_dir: "{{ lookup('env', 'PWD') }}/terraform"
+    terraform_dir: "{{ playbook_dir }}/../terraform"
     terraform_vars:
       - aws_region
       - instance_name
@@ -133,6 +133,22 @@
         sysctl_file: /etc/sysctl.d/99-outline.conf
         reload: true
 
+    - name: Tune network buffers for VPN traffic
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-outline.conf
+        reload: true
+      loop:
+        - { name: net.core.rmem_default, value: "262144" }
+        - { name: net.core.wmem_default, value: "262144" }
+        - { name: net.core.rmem_max, value: "4194304" }
+        - { name: net.core.wmem_max, value: "4194304" }
+        - { name: net.ipv4.tcp_rmem, value: "4096 131072 4194304" }
+        - { name: net.ipv4.tcp_wmem, value: "4096 16384 4194304" }
+        - { name: net.ipv4.tcp_mtu_probing, value: "1" }
+        - { name: net.ipv4.udp_rmem_min, value: "65536" }
+
     - name: Install fail2ban
       ansible.builtin.package:
         name: fail2ban
@@ -176,12 +192,12 @@
   gather_facts: false
   vars:
     outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
-    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
     outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
   tasks:
     - name: Load shared variables
       ansible.builtin.include_vars:
-        file: "{{ lookup('env', 'PWD') }}/terraform/global.auto.tfvars.json"
+        file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
         name: global_vars
 
     - name: Create local Outline directory
@@ -249,7 +265,7 @@
   gather_facts: false
   vars:
     outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
-    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
     outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
     outline_state_dir: "{{ global_vars.outline_dir }}/persisted-state"
   tasks:
@@ -263,7 +279,7 @@
 
     - name: Load shared variables
       ansible.builtin.include_vars:
-        file: "{{ lookup('env', 'PWD') }}/terraform/global.auto.tfvars.json"
+        file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
         name: global_vars
 
     - name: Install Docker
@@ -281,6 +297,27 @@
       ansible.builtin.package:
         name: python3-docker
         state: present
+
+    - name: Allow Shadowbox TCP traffic
+      ansible.posix.firewalld:
+        port: "{{ global_vars.outline_keys_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Allow Shadowbox UDP traffic
+      ansible.posix.firewalld:
+        port: "{{ global_vars.outline_keys_port }}/udp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Allow Outline management API traffic
+      ansible.posix.firewalld:
+        port: "{{ global_vars.outline_api_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
 
     - name: Create persistent state directory
       ansible.builtin.file:
@@ -411,12 +448,12 @@
   gather_facts: false
   vars:
     outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
-    local_outline_dir: "{{ lookup('env', 'PWD') }}/files/outline"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
     outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
   tasks:
     - name: Load shared variables
       ansible.builtin.include_vars:
-        file: "{{ lookup('env', 'PWD') }}/terraform/global.auto.tfvars.json"
+        file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
         name: global_vars
 
     - name: Ping server over ICMPv4
@@ -478,7 +515,7 @@
 
     - name: Save current server addresses
       ansible.builtin.copy:
-        dest: "{{ lookup('env', 'PWD') }}/files/outline/addresses.txt"
+        dest: "{{ playbook_dir }}/../files/outline/addresses.txt"
         mode: "0644"
         content: "IPV$: {{ aws_public_ip_address }}\nIPV6: {{ aws_ipv6_address }}\n"
       delegate_to: localhost

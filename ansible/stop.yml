@@ -4,7 +4,7 @@
   connection: local
   gather_facts: false
   vars:
-    terraform_dir: "{{ lookup('env', 'PWD') }}/terraform"
+    terraform_dir: "{{ playbook_dir }}/../terraform"
   tasks:
     - name: Load shared variables
       ansible.builtin.include_vars:

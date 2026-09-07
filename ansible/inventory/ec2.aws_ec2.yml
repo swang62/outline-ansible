@@ -1,9 +1,9 @@
 ---
 plugin: amazon.aws.aws_ec2
 regions:
-  - "{{ (lookup('file', lookup('env', 'PWD') + '/terraform/global.auto.tfvars.json') | from_json).aws_region }}"
+  - us-west-1
 filters:
-  instance-id: "{{ lookup('pipe', 'terraform -chdir=' + lookup('env', 'PWD') + '/terraform output -raw instance_id') | trim }}"
+  tag:Name: outline-ec2
 hostnames:
   - ip-address
 hostvars_prefix: aws_
