@@ -33,7 +33,7 @@ resource "aws_vpc_ipv6_cidr_block_association" "main" {
 
 resource "aws_subnet" "instance" {
   vpc_id                  = data.aws_vpc.default.id
-  cidr_block              = cidrsubnet(data.aws_vpc.default.cidr_block, 4, 2)
+  cidr_block              = cidrsubnet(data.aws_vpc.default.cidr_block, 4, 15)
   availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
   ipv6_cidr_block         = cidrsubnet(aws_vpc_ipv6_cidr_block_association.main.ipv6_cidr_block, 8, 0)
@@ -56,10 +56,10 @@ resource "aws_security_group" "instance" {
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
+    description      = "SSH"
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
     cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
   }
@@ -107,10 +107,10 @@ resource "aws_security_group" "instance" {
   }
 
   ingress {
-    description = "Outline management API"
-    from_port   = 50443
-    to_port     = 50443
-    protocol    = "tcp"
+    description      = "Outline management API"
+    from_port        = 50443
+    to_port          = 50443
+    protocol         = "tcp"
     cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
   }
@@ -136,6 +136,10 @@ resource "aws_instance" "instance" {
   associate_public_ip_address = true
   ipv6_address_count          = 1
 
+  credit_specification {
+    cpu_credits = "unlimited"
+  }
+
   root_block_device {
     volume_size           = 10
     volume_type           = "gp3"
@@ -148,7 +152,7 @@ resource "aws_instance" "instance" {
 
   lifecycle {
     # ponytail: IPs change on every stop/start; don't let them force replacement
-    ignore_changes = [ami, associate_public_ip_address, public_ip, private_ip, ipv6_address_count, ipv6_addresses]
+    ignore_changes = [ami, associate_public_ip_address, private_ip, ipv6_address_count, ipv6_addresses]
   }
 }
 

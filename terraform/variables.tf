@@ -23,3 +23,23 @@ variable "cloudflare_zone" {
 variable "cloudflare_dns_name" {
   type = string
 }
+
+variable "outline_api_port" {
+  type = number
+}
+
+variable "outline_keys_port" {
+  type = number
+}
+
+variable "outline_prefix" {
+  type = string
+}
+
+variable "outline_image" {
+  type = string
+}
+
+variable "outline_dir" {
+  type = string
+}

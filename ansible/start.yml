@@ -30,13 +30,27 @@
     - name: Refresh inventory
       ansible.builtin.meta: refresh_inventory
 
+    - name: Wait for a running server with public addresses
+      amazon.aws.ec2_instance_info:
+        region: "{{ global_vars.aws_region }}"
+        filters:
+          "tag:Name": "{{ global_vars.instance_name }}"
+          instance-state-name: running
+      register: server_info
+      until:
+        - server_info.instances | length == 1
+        - server_info.instances[0].public_ip_address is defined
+        - server_info.instances[0].ipv6_address is defined
+      retries: 30
+      delay: 10
+
     - name: Update cloudflare DNS
       community.general.cloudflare_dns:
         api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
         zone: "{{ global_vars.cloudflare_zone }}"
         record: "{{ global_vars.cloudflare_dns_name }}"
         type: A
-        value: "{{ hostvars[groups['aws_ec2'][0]].aws_public_ip_address }}"
+        value: "{{ server_info.instances[0].public_ip_address }}"
         ttl: 60
         proxied: false
         solo: true
@@ -50,7 +64,7 @@
         zone: "{{ global_vars.cloudflare_zone }}"
         record: "{{ global_vars.cloudflare_dns_name }}"
         type: AAAA
-        value: "{{ hostvars[groups['aws_ec2'][0]].aws_ipv6_address }}"
+        value: "{{ server_info.instances[0].ipv6_address }}"
         ttl: 60
         proxied: false
         solo: true
@@ -62,9 +76,6 @@
   hosts: aws_ec2
   become: true
   gather_facts: false
-  vars:
-    local_outline_dir: "{{ playbook_dir }}/../files/outline"
-    terraform_dir: "{{ playbook_dir }}/../terraform"
   tasks:
     - name: Wait for SSH to become available
       ansible.builtin.wait_for_connection:
@@ -86,12 +97,5 @@
       ansible.builtin.assert:
         that:
           - shadowbox_status.stdout == "running"
-        success_msg: "Server online, shadowbox running"
-
-    - name: Save current server addresses
-      ansible.builtin.copy:
-        dest: "{{ local_outline_dir }}/addresses.txt"
-        mode: "0644"
-        content: "{{ aws_public_ip_address }} {{ aws_ipv6_address }}\n"
-      delegate_to: localhost
-      become: false
+        fail_msg: "Server started but Shadowbox is not running; run setup.yml to configure it."
+        success_msg: "Server online, Shadowbox running"

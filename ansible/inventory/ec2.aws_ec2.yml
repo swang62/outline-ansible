@@ -1,7 +1,7 @@
 ---
 plugin: amazon.aws.aws_ec2
 regions:
-  - us-west-1
+  - ap-southeast-2
 filters:
   tag:Name: outline-ec2
 hostnames:

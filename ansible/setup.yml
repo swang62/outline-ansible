@@ -27,8 +27,21 @@
         variables: "{{ global_vars | dict2items | selectattr('key', 'in', terraform_vars) | items2dict }}"
       register: tf_result
 
-    - name: Refresh inventory
-      ansible.builtin.meta: refresh_inventory
+    - name: Wait for a running server with a public IP
+      amazon.aws.ec2_instance_info:
+        region: "{{ global_vars.aws_region }}"
+        filters:
+          "tag:Name": "{{ global_vars.instance_name }}"
+          instance-state-name: running
+      register: server_info
+      until:
+        - server_info.instances | length > 0
+        - server_info.instances[0].public_ip_address is defined
+        - server_info.instances[0].ipv6_address is defined
+        - server_info.instances[0].public_ip_address is match('^(?!0\.0\.0\.0$)(?!127\.)(?!169\.254\.)(?!10\.)(?!192\.168\.)(?!172\.(1[6-9]|2[0-9]|3[0-1])\.)([0-9]{1,3}\.){3}[0-9]{1,3}$')
+      retries: 30
+      delay: 10
+      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
 
     - name: Update cloudflare DNS
       community.general.cloudflare_dns:
@@ -36,13 +49,15 @@
         zone: "{{ global_vars.cloudflare_zone }}"
         record: "{{ global_vars.cloudflare_dns_name }}"
         type: A
-        value: "{{ hostvars[groups['aws_ec2'][0]].aws_public_ip_address }}"
+        value: >-
+          {{ server_info.instances[0].public_ip_address }}
         ttl: 60
         proxied: false
         solo: true
         state: present
       no_log: true
-      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+      when:
+        - lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
 
     - name: Update cloudflare IPv6 DNS
       community.general.cloudflare_dns:
@@ -50,13 +65,15 @@
         zone: "{{ global_vars.cloudflare_zone }}"
         record: "{{ global_vars.cloudflare_dns_name }}"
         type: AAAA
-        value: "{{ hostvars[groups['aws_ec2'][0]].aws_ipv6_address }}"
+        value: >-
+          {{ server_info.instances[0].ipv6_address }}
         ttl: 60
         proxied: false
         solo: true
         state: present
       no_log: true
-      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+      when:
+        - lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
 
 - name: Configure server
   hosts: aws_ec2
@@ -103,21 +120,19 @@
         state: present
         create: true
 
-    - name: Install boot-time update service
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/dnf-update-boot.service
-        content: |
-          [Unit]
-          Description=Full dnf update at boot
-          Wants=network-online.target
-          After=network-online.target
-
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/bin/dnf -y update
-
-          [Install]
-          WantedBy=multi-user.target
+    # - name: Install boot-time update service
+    #   ansible.builtin.copy:
+    #     dest: /etc/systemd/system/dnf-update-boot.service
+    #     content: |
+    #       [Unit]
+    #       Description=Full dnf update at boot
+    #       Wants=network-online.target
+    #       After=network-online.target
+    #       [Service]
+    #       Type=oneshot
+    #       ExecStart=/usr/bin/dnf -y update
+    #       [Install]
+    #       WantedBy=multi-user.target
 
     - name: Enable BBR congestion control
       ansible.posix.sysctl:
@@ -149,30 +164,29 @@
         - { name: net.ipv4.tcp_mtu_probing, value: "1" }
         - { name: net.ipv4.udp_rmem_min, value: "65536" }
 
-    - name: Install fail2ban
-      ansible.builtin.package:
-        name: fail2ban
-        state: present
-
-    - name: Configure fail2ban jail
-      ansible.builtin.copy:
-        dest: /etc/fail2ban/jail.d/sshd.local
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          [sshd]
-          enabled = true
-          port = 22
-          filter = sshd
-          backend = systemd
-          maxretry = 5
-          findtime = 10m
-          bantime = 1h
-          bantime.increment = true
-          bantime.maxtime = 1d
-          banaction = firewallcmd-ipset
-      notify: Apply services
+    # - name: Install fail2ban
+    #   ansible.builtin.package:
+    #     name: fail2ban
+    #     state: present
+    # - name: Configure fail2ban jail
+    #   ansible.builtin.copy:
+    #     dest: /etc/fail2ban/jail.d/sshd.local
+    #     owner: root
+    #     group: root
+    #     mode: "0644"
+    #     content: |
+    #       [sshd]
+    #       enabled = true
+    #       port = 22
+    #       filter = sshd
+    #       backend = systemd
+    #       maxretry = 5
+    #       findtime = 10m
+    #       bantime = 1h
+    #       bantime.increment = true
+    #       bantime.maxtime = 1d
+    #       banaction = firewallcmd-ipset
+    #   notify: Apply services
 
   handlers:
     - name: Apply services
@@ -182,9 +196,9 @@
         enabled: true
         state: restarted
       loop:
-        - dnf-update-boot.service
         - sshd
-        - fail2ban
+        # - dnf-update-boot.service
+        # - fail2ban
 
 - name: Generate Outline TLS certificate
   hosts: localhost
@@ -298,26 +312,18 @@
         name: python3-docker
         state: present
 
-    - name: Allow Shadowbox TCP traffic
-      ansible.posix.firewalld:
-        port: "{{ global_vars.outline_keys_port }}/tcp"
-        permanent: true
-        immediate: true
-        state: enabled
+    - name: Disable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: stopped
+        enabled: false
 
-    - name: Allow Shadowbox UDP traffic
-      ansible.posix.firewalld:
-        port: "{{ global_vars.outline_keys_port }}/udp"
-        permanent: true
-        immediate: true
-        state: enabled
-
-    - name: Allow Outline management API traffic
-      ansible.posix.firewalld:
-        port: "{{ global_vars.outline_api_port }}/tcp"
-        permanent: true
-        immediate: true
-        state: enabled
+    - name: Disable UFW
+      ansible.builtin.systemd:
+        name: ufw
+        state: stopped
+        enabled: false
+      failed_when: false
 
     - name: Create persistent state directory
       ansible.builtin.file:
