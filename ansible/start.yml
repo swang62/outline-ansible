@@ -5,6 +5,7 @@
   gather_facts: false
   vars:
     terraform_dir: "{{ playbook_dir }}/../terraform"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
     terraform_vars:
       - aws_region
       - instance_name
@@ -44,6 +45,41 @@
       retries: 30
       delay: 10
 
+    - name: Test SSH over IPv6
+      ansible.builtin.wait_for:
+        host: "{{ server_info.instances[0].ipv6_address }}"
+        port: 22
+        state: started
+        timeout: 5
+      register: ssh_ipv6
+      failed_when: false
+
+    - name: Test SSH over IPv4
+      ansible.builtin.wait_for:
+        host: "{{ server_info.instances[0].public_ip_address }}"
+        port: 22
+        state: started
+        timeout: 5
+      register: ssh_ipv4
+      failed_when: false
+
+    - name: Require one reachable SSH address
+      ansible.builtin.assert:
+        that:
+          - ssh_ipv4.state | default('') == 'started' or ssh_ipv6.state | default('') == 'started'
+        fail_msg: "SSH is unreachable over both public IPv4 and IPv6."
+
+    - name: Add ready server to inventory
+      ansible.builtin.add_host:
+        name: outline_server
+        groups: ready_server
+        ansible_host: "{{ server_info.instances[0].public_ip_address if ssh_ipv4.state | default('') == 'started' else server_info.instances[0].ipv6_address }}"
+        ansible_user: ec2-user
+        ansible_private_key_file: "{{ global_vars.ssh_public_key_path | regex_replace('\\.pub$', '') }}"
+        ansible_python_interpreter: /usr/bin/python3.9
+        aws_public_ip_address: "{{ server_info.instances[0].public_ip_address }}"
+        aws_ipv6_address: "{{ server_info.instances[0].ipv6_address }}"
+
     - name: Update cloudflare DNS
       community.general.cloudflare_dns:
         api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
@@ -72,16 +108,24 @@
       no_log: true
       when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
 
+    - name: Server addresses
+      ansible.builtin.debug:
+        msg: >-
+          IPv4 {{ server_info.instances[0].public_ip_address }} |
+          IPv6 {{ server_info.instances[0].ipv6_address }} |
+          SSH {{ server_info.instances[0].public_ip_address if ssh_ipv4.state | default('') == 'started' else server_info.instances[0].ipv6_address }}
+
+    - name: Save current server addresses
+      ansible.builtin.copy:
+        dest: "{{ local_outline_dir }}/addresses.txt"
+        mode: "0644"
+        content: "IPV4: {{ server_info.instances[0].public_ip_address }}\nIPV6: {{ server_info.instances[0].ipv6_address }}\n"
+
 - name: Verify server is online
-  hosts: aws_ec2
+  hosts: ready_server
   become: true
   gather_facts: false
   tasks:
-    - name: Wait for SSH to become available
-      ansible.builtin.wait_for_connection:
-        timeout: 600
-        sleep: 5
-
     - name: Check shadowbox container status
       ansible.builtin.command:
         argv:

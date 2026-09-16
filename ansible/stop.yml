@@ -24,8 +24,14 @@
       ansible.builtin.shell:
         cmd: |
           id="{{ tf_instance_id.stdout | trim }}"
-          [ -z "$id" ] && exit 0
-          aws ec2 describe-instances --instance-ids "$id" --region {{ global_vars.aws_region }} --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown
+          if [ -z "$id" ]; then
+            exit 0
+          fi
+          aws ec2 describe-instances \
+            --instance-ids "$id" \
+            --region "{{ global_vars.aws_region }}" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text 2>/dev/null || echo unknown
       register: instance_state
       changed_when: false
       failed_when: false
@@ -48,6 +54,10 @@
     - name: Report result
       ansible.builtin.debug:
         msg: >-
-          {{ 'instance ' + (tf_instance_id.stdout | trim) + ' stopped' if (tf_instance_id.stdout | trim | length > 0 and instance_state.stdout | trim == 'running')
-             else 'no instance found' if tf_instance_id.stdout | trim | length == 0
-             else 'instance ' + (tf_instance_id.stdout | trim) + ' already ' + (instance_state.stdout | trim) + ', nothing to do' }}
+          {% if tf_instance_id.stdout | trim | length > 0 and instance_state.stdout | trim == 'running' %}
+          instance {{ tf_instance_id.stdout | trim }} stopped
+          {% elif tf_instance_id.stdout | trim | length == 0 %}
+          no instance found
+          {% else %}
+          instance {{ tf_instance_id.stdout | trim }} already {{ instance_state.stdout | trim }}, nothing to do
+          {% endif %}

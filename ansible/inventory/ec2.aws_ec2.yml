@@ -11,4 +11,3 @@ compose:
   ec2_tags: aws_ec2_tags
   ansible_user: "'ec2-user'"
   ansible_private_key_file: "'~/.ssh/outline-ec2'"
-  ansible_host: aws_ipv6_address | default(aws_public_ip_address)
