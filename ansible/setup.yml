@@ -154,20 +154,6 @@
         create: true
         mode: "0644"
 
-    # - name: Install boot-time update service
-    #   ansible.builtin.copy:
-    #     dest: /etc/systemd/system/dnf-update-boot.service
-    #     content: |
-    #       [Unit]
-    #       Description=Full dnf update at boot
-    #       Wants=network-online.target
-    #       After=network-online.target
-    #       [Service]
-    #       Type=oneshot
-    #       ExecStart=/usr/bin/dnf -y update
-    #       [Install]
-    #       WantedBy=multi-user.target
-
     - name: Enable BBR congestion control
       ansible.posix.sysctl:
         name: net.ipv4.tcp_congestion_control
@@ -198,30 +184,6 @@
         - { name: net.ipv4.tcp_mtu_probing, value: "1" }
         - { name: net.ipv4.udp_rmem_min, value: "65536" }
 
-    # - name: Install fail2ban
-    #   ansible.builtin.package:
-    #     name: fail2ban
-    #     state: present
-    # - name: Configure fail2ban jail
-    #   ansible.builtin.copy:
-    #     dest: /etc/fail2ban/jail.d/sshd.local
-    #     owner: root
-    #     group: root
-    #     mode: "0644"
-    #     content: |
-    #       [sshd]
-    #       enabled = true
-    #       port = 22
-    #       filter = sshd
-    #       backend = systemd
-    #       maxretry = 5
-    #       findtime = 10m
-    #       bantime = 1h
-    #       bantime.increment = true
-    #       bantime.maxtime = 1d
-    #       banaction = firewallcmd-ipset
-    #   notify: Apply services
-
   handlers:
     - name: Apply services
       ansible.builtin.systemd:
@@ -231,8 +193,6 @@
         state: restarted
       loop:
         - sshd
-        # - dnf-update-boot.service
-        # - fail2ban
 
 - name: Generate Outline TLS certificate
   hosts: localhost
