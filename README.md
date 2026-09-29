@@ -1,18 +1,20 @@
 # Outline Server with Ansible/Terraform
 
-This provisions an AWS EC2 instance with Outline Server VPN:
+This provisions an AWS EC2 instance with Outline Server and AmneziaWG VPN:
 
 - Amazon Linux AMI
 - A 10 GiB `gp3` root volume
-- Inbound ports 22, 80, and 443
+- Inbound ports 22, 80, 443, 8443 (TCP and UDP), 3389 (UDP), and 50443 (TCP)
 - Key-only SSH access
-- `quay.io/outline/shadowbox:stable` container
-- Access keys on port 443
-- Management API on port 50443
+- `quay.io/outline/shadowbox:stable` and `ghcr.io/mhsanaei/3x-ui:latest` containers
+- 3x-ui panel on TCP port 443
+- Outline access keys on TCP and UDP port 8443
+- AmneziaWG on UDP port 3389
+- Outline API on TCP port 50443
 
 ## Setup
 
-Global settings live in `terraform/global.auto.tfvars.json`. AWS CLI, Terraform, and Ansible must be pre-installed.
+Global settings live in `terraform/global.auto.tfvars.json`. AWS CLI, Terraform, Ansible, and `qrencode` must be pre-installed.
 
 ```sh
 # Install dependencies
@@ -29,7 +31,7 @@ ansible-inventory --list
 ansible all -m ping
 ```
 
-Both playbooks are idempotent and safe to re-run. Shared variables live in `ansible/group_vars/`; the Outline API prefix and ports are set there.
+Both playbooks are idempotent and safe to re-run. Shared variables and ports live in `terraform/global.auto.tfvars.json`; the Outline API prefix is stored in `files/outline/`.
 
 ## Credentials
 

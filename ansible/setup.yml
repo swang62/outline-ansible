@@ -18,106 +18,26 @@
         file: "{{ terraform_dir }}/global.auto.tfvars.json"
         name: global_vars
 
-    - name: Apply terraform configuration
-      cloud.terraform.terraform:
-        project_path: "{{ terraform_dir }}"
-        state: present
-        force_init: true
-        complex_vars: true
-        variables: "{{ global_vars | dict2items | selectattr('key', 'in', terraform_vars) | items2dict }}"
-      register: tf_result
+    - name: Provision the ready server
+      ansible.builtin.import_tasks: tasks/provision_ready_server.yml
 
-    - name: Refresh inventory
-      ansible.builtin.meta: refresh_inventory
+    - name: Reconcile Cloudflare DNS records
+      ansible.builtin.import_tasks: tasks/cloudflare_dns.yml
 
-    - name: Wait for a running server with a public IP
-      amazon.aws.ec2_instance_info:
-        region: "{{ global_vars.aws_region }}"
-        filters:
-          "tag:Name": "{{ global_vars.instance_name }}"
-          instance-state-name: running
-      register: server_info
-      until:
-        - server_info.instances | length > 0
-        - server_info.instances[0].public_ip_address is defined
-        - server_info.instances[0].ipv6_address is defined
-        - server_info.instances[0].public_ip_address is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
-        - server_info.instances[0].public_ip_address is not match('^(0\.0\.0\.0$|127\.|169\.254\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)')
-      retries: 30
-      delay: 10
-
-    - name: Test SSH over IPv6
-      ansible.builtin.wait_for:
-        host: "{{ server_info.instances[0].ipv6_address }}"
-        port: 22
-        state: started
-        timeout: 5
-      register: ssh_ipv6
-      failed_when: false
-
-    - name: Test SSH over IPv4
-      ansible.builtin.wait_for:
-        host: "{{ server_info.instances[0].public_ip_address }}"
-        port: 22
-        state: started
-        timeout: 5
-      register: ssh_ipv4
-      failed_when: false
-
-    - name: Require one reachable SSH address
-      ansible.builtin.assert:
-        that:
-          - ssh_ipv4.state | default('') == 'started' or ssh_ipv6.state | default('') == 'started'
-        fail_msg: "SSH is unreachable over both public IPv4 and IPv6."
-
-    - name: Add ready server to inventory
-      ansible.builtin.add_host:
-        name: outline_server
-        groups: ready_server
-        ansible_host: "{{ server_info.instances[0].public_ip_address if ssh_ipv4.state | default('') == 'started' else server_info.instances[0].ipv6_address }}"
-        ansible_user: ec2-user
-        ansible_private_key_file: "{{ global_vars.ssh_public_key_path | regex_replace('\\.pub$', '') }}"
-        ansible_python_interpreter: /usr/bin/python3.9
-        aws_public_ip_address: "{{ server_info.instances[0].public_ip_address }}"
-        aws_ipv6_address: "{{ server_info.instances[0].ipv6_address }}"
-
-    - name: Update cloudflare DNS
-      community.general.cloudflare_dns:
-        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
-        zone: "{{ global_vars.cloudflare_zone }}"
-        record: "{{ global_vars.cloudflare_dns_name }}"
-        type: A
-        value: >-
-          {{ server_info.instances[0].public_ip_address }}
-        ttl: 60
-        proxied: false
-        solo: true
-        state: present
-      no_log: true
-      when:
-        - lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
-
-    - name: Update cloudflare IPv6 DNS
-      community.general.cloudflare_dns:
-        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
-        zone: "{{ global_vars.cloudflare_zone }}"
-        record: "{{ global_vars.cloudflare_dns_name }}"
-        type: AAAA
-        value: >-
-          {{ server_info.instances[0].ipv6_address }}
-        ttl: 60
-        proxied: false
-        solo: true
-        state: present
-      no_log: true
-      when:
-        - lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
-
-- name: Configure server
+- name: Base system setup
   hosts: ready_server
   become: true
   gather_facts: false
+  vars:
+    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
+    local_xui_dir: "{{ playbook_dir }}/../files/amneziawg"
   tasks:
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
+        name: global_vars
+
     - name: Configure key-only SSH
       ansible.builtin.copy:
         dest: /etc/ssh/sshd_config.d/99-key-only.conf
@@ -184,6 +104,177 @@
         - { name: net.ipv4.tcp_mtu_probing, value: "1" }
         - { name: net.ipv4.udp_rmem_min, value: "65536" }
 
+    - name: Enable IPv6 forwarding for Docker
+      ansible.posix.sysctl:
+        name: net.ipv6.conf.all.forwarding
+        value: "1"
+        sysctl_file: /etc/sysctl.d/99-outline.conf
+        reload: true
+
+    - name: Discover the interface carrying the default IPv6 route
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -6
+          - route
+          - show
+          - default
+      register: ipv6_default_route
+      changed_when: false
+
+    - name: Resolve the IPv6 uplink interface
+      ansible.builtin.set_fact:
+        ipv6_uplink_interface: "{{ ipv6_default_route.stdout | regex_search('dev (\\S+)', '\\1') | first | default('') }}"
+
+    - name: Preserve router advertisements on the IPv6 uplink while forwarding is enabled
+      ansible.posix.sysctl:
+        name: "net.ipv6.conf.{{ ipv6_uplink_interface }}.accept_ra"
+        value: "2"
+        sysctl_file: /etc/sysctl.d/99-outline.conf
+        reload: true
+      when: ipv6_uplink_interface | length > 0
+
+    - name: Install Docker
+      ansible.builtin.package:
+        name: docker
+        state: present
+
+    - name: Enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Install Docker SDK for Python
+      ansible.builtin.package:
+        name: python3-docker
+        state: present
+
+    - name: Read any existing Docker daemon configuration
+      ansible.builtin.slurp:
+        src: /etc/docker/daemon.json
+      register: docker_daemon_existing
+      failed_when: false
+
+    - name: Configure the Docker default bridge for IPv6
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ ((docker_daemon_existing.content | default('')) | b64decode | default('{}', true) | from_json)
+             | combine(docker_daemon_ipv6) | to_nice_json }}
+      vars:
+        docker_daemon_ipv6:
+          ipv6: true
+          fixed-cidr-v6: "fd00:dead:beef::/64"
+          ip6tables: true
+      notify: Restart Docker
+
+    - name: Check installed firewall services
+      ansible.builtin.service_facts:
+
+    - name: Disable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: stopped
+        enabled: false
+      when: ansible_facts.services.get('firewalld.service', {}).get('status', 'not-found') != 'not-found'
+
+    - name: Disable UFW
+      ansible.builtin.systemd:
+        name: ufw
+        state: stopped
+        enabled: false
+      when: ansible_facts.services.get('ufw.service', {}).get('status', 'not-found') != 'not-found'
+
+    - name: Check whether the Shadowbox container is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Running}}' }}"
+          - shadowbox
+      register: shadowbox_status
+      changed_when: false
+      failed_when: false
+
+    - name: Apply pending service and Docker restarts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check whether the 3x-ui container is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Running}}' }}"
+          - 3x-ui
+      register: xui_container_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check for a stored 3x-ui API token
+      ansible.builtin.stat:
+        path: "{{ local_xui_dir }}/api-token.txt"
+      register: xui_token_file
+      delegate_to: localhost
+      become: false
+
+    - name: Read the stored 3x-ui API token
+      ansible.builtin.set_fact:
+        xui_api_token: "{{ lookup('ansible.builtin.file', local_xui_dir + '/api-token.txt') | trim }}"
+      when: xui_token_file.stat.exists
+
+    - name: Check the 3x-ui panel API is authenticated and healthy from the controller
+      ansible.builtin.uri:
+        url: "https://{{ global_vars.xui_panel_hostname }}/panel/api/inbounds/list"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: xui_api_probe
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      when: xui_token_file.stat.exists
+
+    - name: Check for a locally persisted Outline API prefix
+      ansible.builtin.stat:
+        path: "{{ local_outline_dir }}/api-prefix"
+      register: outline_api_prefix_file
+      delegate_to: localhost
+      become: false
+
+    - name: Read the locally persisted Outline API prefix
+      ansible.builtin.set_fact:
+        outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+      when: outline_api_prefix_file.stat.exists
+
+    - name: Check the Outline API route is served from the controller
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - --max-time
+          - "10"
+          - --insecure
+          - "https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys"
+      register: outline_api_route
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      when: outline_api_prefix_file.stat.exists
+
   handlers:
     - name: Apply services
       ansible.builtin.systemd:
@@ -193,16 +284,35 @@
         state: restarted
       loop:
         - sshd
+        - docker
 
-- name: Generate Outline TLS certificate
-  hosts: localhost
-  connection: local
+- name: Deploy Outline server
+  hosts: ready_server
+  become: true
   gather_facts: false
   vars:
     outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
     local_outline_dir: "{{ playbook_dir }}/../files/outline"
     outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+    outline_state_dir: "{{ global_vars.outline_dir }}/persisted-state"
   tasks:
+    - name: Skip Outline deployment when Shadowbox runs and the API is healthy
+      ansible.builtin.meta: end_play
+      when:
+        - shadowbox_status is defined
+        - shadowbox_status.rc | default(1) == 0
+        - shadowbox_status.stdout | default('') | trim == 'true'
+        - outline_api_route is defined
+        - outline_api_route.stdout | default('') | trim == '200'
+
+    - name: Guard against running on localhost or an empty target
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname != 'localhost'
+          - groups['ready_server'] | length > 0
+        fail_msg: "Outline deploy must run on a live aws_ec2 host, not localhost and not with an empty inventory."
+        success_msg: "Deploy target is a live server: {{ inventory_hostname }}"
+
     - name: Load shared variables
       ansible.builtin.include_vars:
         file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
@@ -213,6 +323,8 @@
         path: "{{ local_outline_dir }}"
         state: directory
         mode: "0700"
+      delegate_to: localhost
+      become: false
 
     - name: Generate Outline API prefix
       ansible.builtin.shell:
@@ -221,11 +333,15 @@
           head -c 16 /dev/urandom | base64 | tr '/+' '_-' | tr -d '=' > '{{ local_outline_dir }}/api-prefix'
         executable: /bin/bash
         creates: "{{ local_outline_dir }}/api-prefix"
+      delegate_to: localhost
+      become: false
 
     - name: Generate access key password
       ansible.builtin.shell:
         cmd: "openssl rand -hex 16 > '{{ local_outline_dir }}/access-key-password.txt'"
         creates: "{{ local_outline_dir }}/access-key-password.txt"
+      delegate_to: localhost
+      become: false
 
     - name: Generate self-signed certificate
       ansible.builtin.command:
@@ -245,6 +361,8 @@
           - -out
           - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
         creates: "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+      delegate_to: localhost
+      become: false
 
     - name: Compute certificate SHA-256 fingerprint
       ansible.builtin.command:
@@ -258,6 +376,8 @@
           - -fingerprint
       register: outline_cert_fingerprint
       changed_when: false
+      delegate_to: localhost
+      become: false
 
     - name: Write Outline Manager connection file
       ansible.builtin.copy:
@@ -268,66 +388,8 @@
             "apiUrl": "https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}",
             "certSha256": "{{ outline_cert_fingerprint.stdout.split('=')[1] | replace(':', '') }}"
           }
-
-    - name: Outline Manager connection JSON
-      ansible.builtin.debug:
-        msg: "{{ lookup('ansible.builtin.file', local_outline_dir + '/outline-manager.json') | from_json }}"
-
-- name: Deploy Outline server
-  hosts: ready_server
-  become: true
-  gather_facts: false
-  vars:
-    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
-    local_outline_dir: "{{ playbook_dir }}/../files/outline"
-    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
-    outline_state_dir: "{{ global_vars.outline_dir }}/persisted-state"
-  tasks:
-    - name: Guard against running on localhost or an empty target
-      ansible.builtin.assert:
-        that:
-          - inventory_hostname != 'localhost'
-          - groups['ready_server'] | length > 0
-        fail_msg: "Outline deploy must run on a live aws_ec2 host, not localhost and not with an empty inventory."
-        success_msg: "Deploy target is a live server: {{ inventory_hostname }}"
-
-    - name: Load shared variables
-      ansible.builtin.include_vars:
-        file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
-        name: global_vars
-
-    - name: Install Docker
-      ansible.builtin.package:
-        name: docker
-        state: present
-
-    - name: Enable Docker service
-      ansible.builtin.systemd:
-        name: docker
-        state: started
-        enabled: true
-
-    - name: Install Docker SDK for Python
-      ansible.builtin.package:
-        name: python3-docker
-        state: present
-
-    - name: Check installed firewall services
-      ansible.builtin.service_facts:
-
-    - name: Disable firewalld
-      ansible.builtin.systemd:
-        name: firewalld
-        state: stopped
-        enabled: false
-      when: ansible_facts.services.get('firewalld.service', {}).get('status', 'not-found') != 'not-found'
-
-    - name: Disable UFW
-      ansible.builtin.systemd:
-        name: ufw
-        state: stopped
-        enabled: false
-      when: ansible_facts.services.get('ufw.service', {}).get('status', 'not-found') != 'not-found'
+      delegate_to: localhost
+      become: false
 
     - name: Create persistent state directory
       ansible.builtin.file:
@@ -372,7 +434,11 @@
         image: "{{ global_vars.outline_image }}"
         state: started
         restart_policy: unless-stopped
-        network_mode: host
+        network_mode: bridge
+        published_ports:
+          - "{{ global_vars.outline_keys_port }}:{{ global_vars.outline_keys_port }}/tcp"
+          - "{{ global_vars.outline_keys_port }}:{{ global_vars.outline_keys_port }}/udp"
+          - "{{ global_vars.outline_api_port }}:{{ global_vars.outline_api_port }}/tcp"
         log_driver: local
         volumes:
           - "{{ outline_state_dir }}:{{ outline_state_dir }}"
@@ -391,12 +457,14 @@
           - --show-error
           - --fail
           - --insecure
-          - https://localhost:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
       register: outline_access_keys
       until: outline_access_keys.rc == 0
       retries: 30
       delay: 2
       changed_when: false
+      delegate_to: localhost
+      become: false
 
     - name: Create first access key
       ansible.builtin.command:
@@ -412,8 +480,10 @@
           - Content-Type:application/json
           - -d
           - '{{ {"password": lookup("ansible.builtin.file", local_outline_dir + "/access-key-password.txt") | trim} | to_json }}'
-          - https://localhost:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
       changed_when: true
+      delegate_to: localhost
+      become: false
       when: (outline_access_keys.stdout | from_json).accessKeys | length == 0
 
     - name: Read access keys
@@ -424,9 +494,11 @@
           - --show-error
           - --fail
           - --insecure
-          - https://localhost:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
       register: outline_keys_final
       changed_when: false
+      delegate_to: localhost
+      become: false
 
     - name: Save first access key URL
       ansible.builtin.copy:
@@ -436,98 +508,428 @@
       delegate_to: localhost
       become: false
 
-    - name: First access key URL
-      ansible.builtin.debug:
-        msg: "{{ lookup('ansible.builtin.file', local_outline_dir + '/access-key.txt') }}"
+- name: Deploy 3x-ui server
+  hosts: ready_server
+  become: true
+  gather_facts: false
+  vars:
+    local_xui_dir: "{{ playbook_dir }}/../files/amneziawg"
+    outline_state_dir: "{{ global_vars.outline_dir }}/persisted-state"
+    xui_cert_dir: "{{ global_vars.xui_dir }}/cert"
+    xui_panel_cert: /root/cert/panel.crt
+    xui_panel_key: /root/cert/panel.key
+    xui_panel_username: "admin"
+    xui_panel_password: "{{ lookup('ansible.builtin.password', local_xui_dir + '/panel-password.txt', length=48, chars='0123456789abcdef') }}"
+  tasks:
+    - name: Skip 3x-ui deployment when the container runs and the authenticated API probe is healthy
+      ansible.builtin.meta: end_play
+      when:
+        - xui_container_status is defined
+        - xui_container_status.stdout | default('') | trim == 'true'
+        - xui_api_probe is defined
+        - xui_api_probe.status | default(0) == 200
 
-    - name: Verify Outline API reachable from outside
+    - name: Load shared variables
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
+        name: global_vars
+
+    - name: Create persistent 3x-ui state directories
+      ansible.builtin.file:
+        path: "{{ global_vars.xui_dir }}/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - db
+        - cert
+
+    - name: Run 3x-ui container
+      community.docker.docker_container:
+        name: 3x-ui
+        image: "{{ global_vars.xui_image }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: bridge
+        published_ports:
+          - "{{ global_vars.xui_panel_port }}:443/tcp"
+          - "{{ global_vars.xui_amneziawg_port }}:3389/udp"
+        log_driver: local
+        capabilities:
+          - NET_ADMIN
+          - NET_RAW
+        volumes:
+          - "{{ global_vars.xui_dir }}/db:/etc/x-ui"
+          - "{{ global_vars.xui_dir }}/cert:/root/cert"
+        env:
+          XUI_PORT: "443"
+          XUI_INIT_WEB_BASE_PATH: "/"
+          XUI_ENABLE_FAIL2BAN: "true"
+
+    - name: Create local 3x-ui credential directory
+      ansible.builtin.file:
+        path: "{{ local_xui_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Check for a locally persisted 3x-ui panel username
+      ansible.builtin.stat:
+        path: "{{ local_xui_dir }}/panel-username.txt"
+      register: xui_username_file
+      delegate_to: localhost
+      become: false
+
+    - name: Read the locally persisted 3x-ui panel username
+      ansible.builtin.set_fact:
+        xui_persisted_username: "{{ lookup('ansible.builtin.file', local_xui_dir + '/panel-username.txt') | trim }}"
+      when: xui_username_file.stat.exists
+
+    - name: Store 3x-ui panel credentials locally
+      ansible.builtin.copy:
+        content: "{{ item.content }}\n"
+        dest: "{{ item.dest }}"
+        mode: "0600"
+      loop:
+        - dest: "{{ local_xui_dir }}/panel-username.txt"
+          content: "{{ xui_panel_username }}"
+        - dest: "{{ local_xui_dir }}/panel-password.txt"
+          content: "{{ xui_panel_password }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Upload certificate into the 3x-ui cert volume
+      ansible.builtin.copy:
+        src: "{{ outline_state_dir }}/shadowbox-selfsigned.crt"
+        dest: "{{ xui_cert_dir }}/panel.crt"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Upload private key into the 3x-ui cert volume
+      ansible.builtin.copy:
+        src: "{{ outline_state_dir }}/shadowbox-selfsigned.key"
+        dest: "{{ xui_cert_dir }}/panel.key"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Read current 3x-ui panel settings
+      community.docker.docker_container_exec:
+        container: 3x-ui
+        argv:
+          - /app/x-ui
+          - setting
+          - -show=true
+          - -getCert=true
+      register: xui_panel_settings
+      until: xui_panel_settings.rc | default(1) == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Set the 3x-ui panel credentials and root web base path
+      community.docker.docker_container_exec:
+        container: 3x-ui
+        argv:
+          - /app/x-ui
+          - setting
+          - -username
+          - "{{ xui_panel_username }}"
+          - -password
+          - "{{ xui_panel_password }}"
+          - -webBasePath
+          - /
+      vars:
+        xui_current_web_base_path: >-
+          {{ (xui_panel_settings.stdout_lines
+             | select('match', '^webBasePath:')
+             | map('regex_replace', '^webBasePath:\s*', '')
+             | list | first | default('/', true)) | trim }}
+      when: >-
+        'hasDefaultCredential: true' in xui_panel_settings.stdout
+        or not xui_username_file.stat.exists
+        or (xui_persisted_username | default('') | length > 0
+            and xui_persisted_username != xui_panel_username)
+        or xui_current_web_base_path != '/'
+      notify: Restart 3x-ui
+
+    - name: Configure 3x-ui panel TLS
+      community.docker.docker_container_exec:
+        container: 3x-ui
+        argv:
+          - /app/x-ui
+          - cert
+          - -webCert
+          - "{{ xui_panel_cert }}"
+          - -webCertKey
+          - "{{ xui_panel_key }}"
+      when: xui_panel_cert not in xui_panel_settings.stdout
+      notify: Restart 3x-ui
+
+    - name: Apply pending 3x-ui panel restarts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the 3x-ui panel to serve HTTPS
       ansible.builtin.command:
         argv:
           - curl
           - --silent
           - --show-error
           - --fail
-          - --cacert
-          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
-          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
-      delegate_to: localhost
-      become: false
+          - --insecure
+          - --output
+          - /dev/null
+          - "https://localhost:{{ global_vars.xui_panel_port }}/"
+      register: xui_panel_https
+      until: xui_panel_https.rc | default(1) == 0
+      retries: 30
+      delay: 2
       changed_when: false
 
-- name: Verify server health
+  handlers:
+    - name: Restart 3x-ui
+      ansible.builtin.command:
+        argv:
+          - docker
+          - restart
+          - 3x-ui
+      changed_when: true
+
+- name: Provision the AmneziaWG inbound and bootstrap client through the 3x-ui API
   hosts: ready_server
+  become: true
   gather_facts: false
   vars:
-    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
-    local_outline_dir: "{{ playbook_dir }}/../files/outline"
-    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+    local_xui_dir: "{{ playbook_dir }}/../files/amneziawg"
+    xui_awg_inbound_remark: AmneziaWG-3389
+    xui_awg_client_email: bootstrap-amneziawg
+    xui_api_base: "https://{{ global_vars.xui_panel_hostname }}/panel/api"
   tasks:
     - name: Load shared variables
       ansible.builtin.include_vars:
         file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
         name: global_vars
 
-    - name: Ping server over ICMPv4
-      ansible.builtin.command:
-        argv:
-          - ping
-          - -c
-          - "4"
-          - "{{ aws_public_ip_address }}"
-      delegate_to: localhost
-      changed_when: false
-      failed_when: false
-      register: health_icmp
-
-    - name: Ping server over ICMPv6
-      ansible.builtin.command:
-        argv:
-          - ping6
-          - -c
-          - "4"
-          - "{{ aws_ipv6_address }}"
-      delegate_to: localhost
-      changed_when: false
-      failed_when: false
-      register: health_icmp6
-
-    - name: Ping server over SSH
-      ansible.builtin.ping:
-      register: health_ping
-
-    - name: Verify Outline API reachable from outside
-      ansible.builtin.command:
-        argv:
-          - curl
-          - --silent
-          - --show-error
-          - --fail
-          - --cacert
-          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
-          - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+    - name: Ensure the local AmneziaWG artifact directory exists
+      ansible.builtin.file:
+        path: "{{ local_xui_dir }}"
+        state: directory
+        mode: "0700"
       delegate_to: localhost
       become: false
-      changed_when: false
-      register: health_outline_api
 
-    - name: Server addresses and ping results
-      ansible.builtin.debug:
-        msg: >-
-          IPv4 {{ aws_public_ip_address }} | IPv6 {{ aws_ipv6_address }} |
-          Ping v4: {{ health_icmp.stdout_lines | select('search', 'packet loss') | first | default('no output') }} |
-          Ping v6: {{ health_icmp6.stdout_lines | select('search', 'packet loss') | first | default('no output') }}
+    - name: Check for a stored 3x-ui API token
+      ansible.builtin.stat:
+        path: "{{ local_xui_dir }}/api-token.txt"
+      register: xui_token_file
+      delegate_to: localhost
+      become: false
 
-    - name: Confirm health checks passed
+    - name: Read the stored 3x-ui API token
+      ansible.builtin.set_fact:
+        xui_api_token: "{{ lookup('ansible.builtin.file', local_xui_dir + '/api-token.txt') | trim }}"
+      when: xui_token_file.stat.exists
+
+    # Authentication must exist before any API call, so the official container
+    # command is the only permitted bootstrap step.
+    - name: Bootstrap the 3x-ui API token through the official container command
+      community.docker.docker_container_exec:
+        container: 3x-ui
+        argv:
+          - /app/x-ui
+          - setting
+          - -getApiToken
+          - -tokenName
+          - ansible
+      when: not xui_token_file.stat.exists
+      register: xui_token_bootstrap
+
+    - name: Parse the bootstrapped API token
+      ansible.builtin.set_fact:
+        xui_api_token: >-
+          {{ (xui_token_bootstrap.stdout_lines
+             | select('match', '^apiToken:')
+             | map('regex_replace', '^apiToken:\s*', '')
+             | list | first) | default('') }}
+      when: not xui_token_file.stat.exists
+
+    - name: Require a usable 3x-ui API token
       ansible.builtin.assert:
         that:
-          - health_ping.ping == "pong"
-          - health_outline_api.rc == 0
-        success_msg: "Server healthy over SSH and Outline API is reachable"
+          - xui_api_token | default('') | length > 0
+        fail_msg: "Could not obtain a 3x-ui API token from the panel."
 
-    - name: Save current server addresses
+    - name: Store the 3x-ui API token locally
       ansible.builtin.copy:
-        dest: "{{ playbook_dir }}/../files/outline/addresses.txt"
-        mode: "0644"
-        content: "IPV$: {{ aws_public_ip_address }}\nIPV6: {{ aws_ipv6_address }}\n"
+        content: "{{ xui_api_token }}\n"
+        dest: "{{ local_xui_dir }}/api-token.txt"
+        mode: "0600"
+      when: not xui_token_file.stat.exists
       delegate_to: localhost
       become: false
+
+    - name: List existing 3x-ui inbounds
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/inbounds/list"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: xui_inbounds
+      changed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Resolve the designated AmneziaWG inbound id
+      ansible.builtin.set_fact:
+        xui_awg_inbound_id: >-
+          {{ (xui_inbounds.json.obj
+             | selectattr('protocol', 'equalto', 'amneziawg')
+             | selectattr('port', 'equalto', global_vars.xui_amneziawg_port)
+             | selectattr('remark', 'equalto', xui_awg_inbound_remark)
+             | map(attribute='id') | list | first) | default(0) }}
+
+    - name: Refuse to reuse another inbound that owns the AmneziaWG port
+      ansible.builtin.assert:
+        that:
+          - xui_awg_inbound_id | int != 0
+            or (xui_inbounds.json.obj | selectattr('port', 'equalto', global_vars.xui_amneziawg_port) | list | length) == 0
+        fail_msg: >-
+          Port {{ global_vars.xui_amneziawg_port }} is already owned by an inbound that is not the
+          designated AmneziaWG inbound ({{ xui_awg_inbound_remark }}); refusing to reuse it.
+
+    - name: Create the AmneziaWG inbound
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/inbounds/add"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        body_format: json
+        body:
+          enable: true
+          remark: "{{ xui_awg_inbound_remark }}"
+          listen: ""
+          port: "{{ global_vars.xui_amneziawg_port | int }}"
+          protocol: amneziawg
+          expiryTime: 0
+          total: 0
+          shareAddrStrategy: custom
+          shareAddr: "{{ global_vars.xui_wg_hostname }}"
+          settings: {}
+        validate_certs: false
+        status_code: 200
+      when: xui_awg_inbound_id | int == 0
+      register: xui_awg_create
+      failed_when: not (xui_awg_create.json.success | default(false))
+      delegate_to: localhost
+      become: false
+
+    - name: Record the new AmneziaWG inbound id
+      ansible.builtin.set_fact:
+        xui_awg_inbound_id: "{{ xui_awg_create.json.obj.id }}"
+      when: xui_awg_inbound_id | int == 0
+
+    - name: Read the AmneziaWG inbound and its clients
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/inbounds/get/{{ xui_awg_inbound_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: xui_awg_detail
+      failed_when: not (xui_awg_detail.json.success | default(false))
+      changed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Add the bootstrap AmneziaWG client
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/clients/add"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        body_format: json
+        body:
+          client:
+            email: "{{ xui_awg_client_email }}"
+            enable: true
+          inboundIds:
+            - "{{ xui_awg_inbound_id }}"
+        validate_certs: false
+        status_code: 200
+      when: xui_awg_client_email not in (xui_awg_detail.json.obj.settings.clients | map(attribute='email') | list)
+      register: xui_awg_client_add
+      failed_when: not (xui_awg_client_add.json.success | default(false))
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch the generated AmneziaWG connection link
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/clients/links/{{ xui_awg_client_email }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: xui_awg_links
+      changed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Resolve the AmneziaWG vpn:// link
+      ansible.builtin.set_fact:
+        xui_awg_vpn_link: "{{ (xui_awg_links.json.obj | select('match', '^vpn://') | list | first) | default('') }}"
+
+    - name: Require the AmneziaWG connection link
+      ansible.builtin.assert:
+        that:
+          - xui_awg_vpn_link | length > 0
+        fail_msg: "The panel did not return an AmneziaWG connection link for {{ xui_awg_client_email }}."
+
+    # AmneziaVPN scans the vpn:// connection key, not the decoded .conf content.
+    - name: Generate the local AmneziaWG connection QR code PNG
+      ansible.builtin.command:
+        argv:
+          - qrencode
+          - --output
+          - "{{ local_xui_dir }}/amneziawg-client.png"
+        stdin: "{{ xui_awg_vpn_link }}"
+        stdin_add_newline: false
+      delegate_to: localhost
+      become: false
+      changed_when: true
+
+    - name: Decode the native AmneziaWG client configuration
+      ansible.builtin.set_fact:
+        xui_awg_conf: >-
+          {{ (xui_awg_vpn_link | regex_replace('^vpn://', '') | regex_replace('-', '+') | regex_replace('_', '/')
+             + ('=' * ((4 - (xui_awg_vpn_link | regex_replace('^vpn://', '') | length % 4)) % 4))) | b64decode }}
+
+    - name: Save the AmneziaWG client configuration locally
+      ansible.builtin.copy:
+        dest: "{{ local_xui_dir }}/amneziawg-client.conf"
+        content: "{{ xui_awg_conf }}\n"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+- name: Verify server health
+  hosts: ready_server
+  become: true
+  gather_facts: false
+  vars:
+    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
+    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
+  tasks:
+    - name: Run shared server health checks
+      ansible.builtin.import_tasks: tasks/server_health.yml

@@ -19,94 +19,11 @@
         file: "{{ terraform_dir }}/global.auto.tfvars.json"
         name: global_vars
 
-    - name: Start instance via terraform
-      cloud.terraform.terraform:
-        project_path: "{{ terraform_dir }}"
-        state: present
-        force_init: true
-        complex_vars: true
-        variables: "{{ global_vars | dict2items | selectattr('key', 'in', terraform_vars) | items2dict }}"
-      register: tf_result
+    - name: Provision the ready server
+      ansible.builtin.import_tasks: tasks/provision_ready_server.yml
 
-    - name: Refresh inventory
-      ansible.builtin.meta: refresh_inventory
-
-    - name: Wait for a running server with public addresses
-      amazon.aws.ec2_instance_info:
-        region: "{{ global_vars.aws_region }}"
-        filters:
-          "tag:Name": "{{ global_vars.instance_name }}"
-          instance-state-name: running
-      register: server_info
-      until:
-        - server_info.instances | length == 1
-        - server_info.instances[0].public_ip_address is defined
-        - server_info.instances[0].ipv6_address is defined
-      retries: 30
-      delay: 10
-
-    - name: Test SSH over IPv6
-      ansible.builtin.wait_for:
-        host: "{{ server_info.instances[0].ipv6_address }}"
-        port: 22
-        state: started
-        timeout: 5
-      register: ssh_ipv6
-      failed_when: false
-
-    - name: Test SSH over IPv4
-      ansible.builtin.wait_for:
-        host: "{{ server_info.instances[0].public_ip_address }}"
-        port: 22
-        state: started
-        timeout: 5
-      register: ssh_ipv4
-      failed_when: false
-
-    - name: Require one reachable SSH address
-      ansible.builtin.assert:
-        that:
-          - ssh_ipv4.state | default('') == 'started' or ssh_ipv6.state | default('') == 'started'
-        fail_msg: "SSH is unreachable over both public IPv4 and IPv6."
-
-    - name: Add ready server to inventory
-      ansible.builtin.add_host:
-        name: outline_server
-        groups: ready_server
-        ansible_host: "{{ server_info.instances[0].public_ip_address if ssh_ipv4.state | default('') == 'started' else server_info.instances[0].ipv6_address }}"
-        ansible_user: ec2-user
-        ansible_private_key_file: "{{ global_vars.ssh_public_key_path | regex_replace('\\.pub$', '') }}"
-        ansible_python_interpreter: /usr/bin/python3.9
-        aws_public_ip_address: "{{ server_info.instances[0].public_ip_address }}"
-        aws_ipv6_address: "{{ server_info.instances[0].ipv6_address }}"
-
-    - name: Update cloudflare DNS
-      community.general.cloudflare_dns:
-        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
-        zone: "{{ global_vars.cloudflare_zone }}"
-        record: "{{ global_vars.cloudflare_dns_name }}"
-        type: A
-        value: "{{ server_info.instances[0].public_ip_address }}"
-        ttl: 60
-        proxied: false
-        solo: true
-        state: present
-      no_log: true
-      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
-
-    - name: Update cloudflare IPv6 DNS
-      community.general.cloudflare_dns:
-        api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
-        zone: "{{ global_vars.cloudflare_zone }}"
-        record: "{{ global_vars.cloudflare_dns_name }}"
-        type: AAAA
-        value: "{{ server_info.instances[0].ipv6_address }}"
-        ttl: 60
-        proxied: false
-        solo: true
-        state: present
-      no_log: true
-      when: lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+    - name: Reconcile Cloudflare DNS records
+      ansible.builtin.import_tasks: tasks/cloudflare_dns.yml
 
     - name: Server addresses
       ansible.builtin.debug:
@@ -125,21 +42,10 @@
   hosts: ready_server
   become: true
   gather_facts: false
+  vars:
+    outline_hostname: "{{ global_vars.cloudflare_dns_name }}.{{ global_vars.cloudflare_zone }}"
+    local_outline_dir: "{{ playbook_dir }}/../files/outline"
+    outline_api_prefix: "{{ lookup('ansible.builtin.file', local_outline_dir + '/api-prefix') | trim }}"
   tasks:
-    - name: Check shadowbox container status
-      ansible.builtin.command:
-        argv:
-          - docker
-          - inspect
-          - -f
-          - "{{ '{{' }}.State.Status{{ '}}' }}"
-          - shadowbox
-      register: shadowbox_status
-      changed_when: false
-
-    - name: Confirm shadowbox is running
-      ansible.builtin.assert:
-        that:
-          - shadowbox_status.stdout == "running"
-        fail_msg: "Server started but Shadowbox is not running; run setup.yml to configure it."
-        success_msg: "Server online, Shadowbox running"
+    - name: Run shared server health checks
+      ansible.builtin.import_tasks: tasks/server_health.yml

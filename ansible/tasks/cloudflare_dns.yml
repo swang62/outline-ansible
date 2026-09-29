@@ -1,0 +1,31 @@
+---
+- name: Reconcile Cloudflare DNS records
+  community.general.cloudflare_dns:
+    api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+    zone: "{{ global_vars.cloudflare_zone }}"
+    record: "{{ item.record }}"
+    type: "{{ item.type }}"
+    value: "{{ item.value }}"
+    ttl: 60
+    proxied: "{{ item.proxied }}"
+    solo: true
+    state: present
+  loop:
+    - record: "{{ global_vars.cloudflare_dns_name }}"
+      type: A
+      value: "{{ server_info.instances[0].public_ip_address }}"
+      proxied: false
+    - record: "{{ global_vars.cloudflare_dns_name }}"
+      type: AAAA
+      value: "{{ server_info.instances[0].ipv6_address }}"
+      proxied: false
+    - record: "{{ global_vars.xui_panel_hostname }}"
+      type: A
+      value: "{{ server_info.instances[0].public_ip_address }}"
+      proxied: true
+    - record: "{{ global_vars.xui_panel_hostname }}"
+      type: AAAA
+      value: "{{ server_info.instances[0].ipv6_address }}"
+      proxied: true
+  when:
+    - lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0

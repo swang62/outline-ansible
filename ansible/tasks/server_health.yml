@@ -1,0 +1,108 @@
+---
+- name: Load shared variables
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
+    name: global_vars
+
+- name: Check Shadowbox container status
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - -f
+      - "{{ '{{' }}.State.Status{{ '}}' }}"
+      - shadowbox
+  register: health_shadowbox
+  changed_when: false
+
+- name: Check 3x-ui container status
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - -f
+      - "{{ '{{' }}.State.Status{{ '}}' }}"
+      - 3x-ui
+  register: health_xui
+  changed_when: false
+
+- name: Check the AmneziaWG UDP listener
+  ansible.builtin.command:
+    argv:
+      - ss
+      - -lun
+  register: health_udp
+  changed_when: false
+  failed_when: false
+
+- name: Ping server over ICMPv4
+  ansible.builtin.command:
+    argv:
+      - ping
+      - -c
+      - "4"
+      - "{{ aws_public_ip_address }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+  register: health_icmp
+
+- name: Ping server over ICMPv6
+  ansible.builtin.command:
+    argv:
+      - ping6
+      - -c
+      - "4"
+      - "{{ aws_ipv6_address }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+  register: health_icmp6
+
+- name: Check IPv6 egress from the 3x-ui container
+  community.docker.docker_container_exec:
+    container: 3x-ui
+    argv:
+      - curl
+      - --silent
+      - --show-error
+      - --fail
+      - -6
+      - --max-time
+      - "10"
+      - https://ipv6.icanhazip.com
+  register: health_xui_ipv6
+  changed_when: false
+  failed_when: false
+
+- name: Verify Outline API reachable from outside
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --silent
+      - --show-error
+      - --fail
+      - --cacert
+      - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+      - https://{{ outline_hostname }}:{{ global_vars.outline_api_port }}/{{ outline_api_prefix }}/access-keys
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: health_outline_api
+
+- name: Confirm service health checks passed
+  ansible.builtin.assert:
+    that:
+      - health_shadowbox.stdout == "running"
+      - health_xui.stdout == "running"
+      - health_icmp.rc == 0
+      - health_icmp6.rc == 0
+      - health_xui_ipv6.rc == 0
+      - health_outline_api.rc == 0
+      - (':' ~ (global_vars.xui_amneziawg_port | string) ~ ' ') in health_udp.stdout
+    fail_msg: "Server is up but Outline or AmneziaWG services are unhealthy; run setup.yml to configure it."
+    success_msg: >-
+      Shadowbox and 3x-ui running, ICMPv4 and ICMPv6 reachable, 3x-ui has IPv6 egress,
+      Outline API reachable, UDP {{ global_vars.xui_amneziawg_port }} listening

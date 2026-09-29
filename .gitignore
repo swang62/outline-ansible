@@ -1,7 +1,9 @@
 .terraform/
+.ansible/
 *.tfstate
 *.tfstate.*
 terraform.tfvars
 *.tfvars.json
 files/outline/
+files/amneziawg/
 logs/

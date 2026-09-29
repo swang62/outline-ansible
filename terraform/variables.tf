@@ -43,3 +43,27 @@ variable "outline_image" {
 variable "outline_dir" {
   type = string
 }
+
+variable "xui_image" {
+  type = string
+}
+
+variable "xui_dir" {
+  type = string
+}
+
+variable "xui_panel_hostname" {
+  type = string
+}
+
+variable "xui_wg_hostname" {
+  type = string
+}
+
+variable "xui_panel_port" {
+  type = number
+}
+
+variable "xui_amneziawg_port" {
+  type = number
+}
