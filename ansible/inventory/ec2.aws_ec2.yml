@@ -1,5 +1,7 @@
 ---
 plugin: amazon.aws.aws_ec2
+regions:
+  - "{{ (lookup('ansible.builtin.file', lookup('ansible.builtin.pipe', 'git rev-parse --show-toplevel') + '/terraform/global.auto.tfvars.json') | from_json).aws_region }}"
 filters:
   tag:Name: outline-ec2
 hostnames:

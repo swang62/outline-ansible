@@ -59,7 +59,7 @@
           PermitUserEnvironment no
           PubkeyAuthentication yes
           X11Forwarding no
-      notify: Apply services
+      notify: Restart SSH
 
     - name: Add shell aliases
       ansible.builtin.blockinfile:
@@ -78,37 +78,37 @@
       ansible.posix.sysctl:
         name: net.ipv4.tcp_congestion_control
         value: bbr
-        sysctl_file: /etc/sysctl.d/99-outline.conf
+        sysctl_file: /etc/sysctl.d/99-outline-network.conf
         reload: true
 
-    - name: Enable fq queueing discipline
+    - name: Use the fq queueing discipline
       ansible.posix.sysctl:
         name: net.core.default_qdisc
         value: fq
-        sysctl_file: /etc/sysctl.d/99-outline.conf
+        sysctl_file: /etc/sysctl.d/99-outline-network.conf
         reload: true
 
-    - name: Tune network buffers for VPN traffic
+    - name: Tune kernel network buffers and queues for the tunnel
       ansible.posix.sysctl:
         name: "{{ item.name }}"
         value: "{{ item.value }}"
-        sysctl_file: /etc/sysctl.d/99-outline.conf
+        sysctl_file: /etc/sysctl.d/99-outline-network.conf
         reload: true
       loop:
+        - { name: net.ipv4.ip_forward, value: "1" }
+        - { name: net.ipv4.tcp_mtu_probing, value: "1" }
+        - { name: net.core.rmem_max, value: "16777216" }
+        - { name: net.core.wmem_max, value: "16777216" }
         - { name: net.core.rmem_default, value: "262144" }
         - { name: net.core.wmem_default, value: "262144" }
-        - { name: net.core.rmem_max, value: "4194304" }
-        - { name: net.core.wmem_max, value: "4194304" }
-        - { name: net.ipv4.tcp_rmem, value: "4096 131072 4194304" }
-        - { name: net.ipv4.tcp_wmem, value: "4096 16384 4194304" }
-        - { name: net.ipv4.tcp_mtu_probing, value: "1" }
-        - { name: net.ipv4.udp_rmem_min, value: "65536" }
+        - { name: net.ipv4.udp_mem, value: "4096 87380 16777216" }
+        - { name: net.core.netdev_max_backlog, value: "5000" }
 
-    - name: Enable IPv6 forwarding for Docker
+    - name: Enable IPv6 forwarding for AmneziaWG
       ansible.posix.sysctl:
         name: net.ipv6.conf.all.forwarding
         value: "1"
-        sysctl_file: /etc/sysctl.d/99-outline.conf
+        sysctl_file: /etc/sysctl.d/99-outline-ipv6.conf
         reload: true
 
     - name: Discover the interface carrying the default IPv6 route
@@ -126,11 +126,11 @@
       ansible.builtin.set_fact:
         ipv6_uplink_interface: "{{ ipv6_default_route.stdout | regex_search('dev (\\S+)', '\\1') | first | default('') }}"
 
-    - name: Preserve router advertisements on the IPv6 uplink while forwarding is enabled
+    - name: Preserve router advertisements on the IPv6 uplink
       ansible.posix.sysctl:
         name: "net.ipv6.conf.{{ ipv6_uplink_interface }}.accept_ra"
         value: "2"
-        sysctl_file: /etc/sysctl.d/99-outline.conf
+        sysctl_file: /etc/sysctl.d/99-outline-ipv6.conf
         reload: true
       when: ipv6_uplink_interface | length > 0
 
@@ -167,6 +167,7 @@
              | combine(docker_daemon_ipv6) | to_nice_json }}
       vars:
         docker_daemon_ipv6:
+          experimental: true
           ipv6: true
           fixed-cidr-v6: "fd00:dead:beef::/64"
           ip6tables: true
@@ -200,9 +201,6 @@
       register: shadowbox_status
       changed_when: false
       failed_when: false
-
-    - name: Apply pending service and Docker restarts
-      ansible.builtin.meta: flush_handlers
 
     - name: Check whether the 3x-ui container is running
       ansible.builtin.command:
@@ -276,15 +274,19 @@
       when: outline_api_prefix_file.stat.exists
 
   handlers:
-    - name: Apply services
+    - name: Restart SSH
       ansible.builtin.systemd:
-        name: "{{ item }}"
+        name: sshd
         daemon_reload: true
         enabled: true
         state: restarted
-      loop:
-        - sshd
-        - docker
+
+    - name: Restart Docker
+      ansible.builtin.systemd:
+        name: docker
+        daemon_reload: true
+        enabled: true
+        state: restarted
 
 - name: Deploy Outline server
   hosts: ready_server
@@ -302,6 +304,9 @@
         - shadowbox_status is defined
         - shadowbox_status.rc | default(1) == 0
         - shadowbox_status.stdout | default('') | trim == 'true'
+        - (shadowbox_ports.stdout | default('')) is search('443/tcp -> \\[::\\]:' ~ (global_vars.outline_keys_port | string))
+        - (shadowbox_ports.stdout | default('')) is search('443/udp -> \\[::\\]:' ~ (global_vars.outline_keys_port | string))
+        - (shadowbox_ports.stdout | default('')) is search((global_vars.outline_api_port | string) ~ '/tcp -> \\[::\\]:' ~ (global_vars.outline_api_port | string))
         - outline_api_route is defined
         - outline_api_route.stdout | default('') | trim == '200'
 
@@ -436,9 +441,12 @@
         restart_policy: unless-stopped
         network_mode: bridge
         published_ports:
-          - "{{ global_vars.outline_keys_port }}:{{ global_vars.outline_keys_port }}/tcp"
-          - "{{ global_vars.outline_keys_port }}:{{ global_vars.outline_keys_port }}/udp"
+          - "{{ global_vars.outline_keys_port }}:443/tcp"
+          - "[::]:{{ global_vars.outline_keys_port }}:443/tcp"
+          - "{{ global_vars.outline_keys_port }}:443/udp"
+          - "[::]:{{ global_vars.outline_keys_port }}:443/udp"
           - "{{ global_vars.outline_api_port }}:{{ global_vars.outline_api_port }}/tcp"
+          - "[::]:{{ global_vars.outline_api_port }}:{{ global_vars.outline_api_port }}/tcp"
         log_driver: local
         volumes:
           - "{{ outline_state_dir }}:{{ outline_state_dir }}"
@@ -526,6 +534,7 @@
       when:
         - xui_container_status is defined
         - xui_container_status.stdout | default('') | trim == 'true'
+        - xui_network_mode.stdout | default('') | trim == 'host'
         - xui_api_probe is defined
         - xui_api_probe.status | default(0) == 200
 
@@ -551,10 +560,7 @@
         image: "{{ global_vars.xui_image }}"
         state: started
         restart_policy: unless-stopped
-        network_mode: bridge
-        published_ports:
-          - "{{ global_vars.xui_panel_port }}:443/tcp"
-          - "{{ global_vars.xui_amneziawg_port }}:3389/udp"
+        network_mode: host
         log_driver: local
         capabilities:
           - NET_ADMIN
@@ -717,14 +723,6 @@
         file: "{{ playbook_dir }}/../terraform/global.auto.tfvars.json"
         name: global_vars
 
-    - name: Ensure the local AmneziaWG artifact directory exists
-      ansible.builtin.file:
-        path: "{{ local_xui_dir }}"
-        state: directory
-        mode: "0700"
-      delegate_to: localhost
-      become: false
-
     - name: Check for a stored 3x-ui API token
       ansible.builtin.stat:
         path: "{{ local_xui_dir }}/api-token.txt"
@@ -737,8 +735,6 @@
         xui_api_token: "{{ lookup('ansible.builtin.file', local_xui_dir + '/api-token.txt') | trim }}"
       when: xui_token_file.stat.exists
 
-    # Authentication must exist before any API call, so the official container
-    # command is the only permitted bootstrap step.
     - name: Bootstrap the 3x-ui API token through the official container command
       community.docker.docker_container_exec:
         container: 3x-ui
@@ -759,12 +755,6 @@
              | map('regex_replace', '^apiToken:\s*', '')
              | list | first) | default('') }}
       when: not xui_token_file.stat.exists
-
-    - name: Require a usable 3x-ui API token
-      ansible.builtin.assert:
-        that:
-          - xui_api_token | default('') | length > 0
-        fail_msg: "Could not obtain a 3x-ui API token from the panel."
 
     - name: Store the 3x-ui API token locally
       ansible.builtin.copy:
@@ -851,6 +841,7 @@
       delegate_to: localhost
       become: false
 
+    # IPv6 is transport-only to this endpoint; the tunnel and egress stay IPv4.
     - name: Add the bootstrap AmneziaWG client
       ansible.builtin.uri:
         url: "{{ xui_api_base }}/clients/add"
@@ -862,6 +853,7 @@
           client:
             email: "{{ xui_awg_client_email }}"
             enable: true
+            keepAlive: 25
           inboundIds:
             - "{{ xui_awg_inbound_id }}"
         validate_certs: false
@@ -869,6 +861,44 @@
       when: xui_awg_client_email not in (xui_awg_detail.json.obj.settings.clients | map(attribute='email') | list)
       register: xui_awg_client_add
       failed_when: not (xui_awg_client_add.json.success | default(false))
+      delegate_to: localhost
+      become: false
+
+    - name: Refresh the AmneziaWG inbound clients
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/inbounds/get/{{ xui_awg_inbound_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        validate_certs: false
+        status_code: 200
+      register: xui_awg_detail
+      failed_when: not (xui_awg_detail.json.success | default(false))
+      changed_when: false
+      delegate_to: localhost
+      become: false
+
+    # PersistentKeepalive keeps the client's NAT mapping open so the tunnel
+    # recovers after idle periods instead of going silent.
+    - name: Keep the bootstrap client NAT mapping alive
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/clients/update/{{ xui_awg_client_email }}?inboundIds={{ xui_awg_inbound_id }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        body_format: json
+        body: >-
+          {{ (xui_awg_detail.json.obj.settings.clients
+             | selectattr('email', 'equalto', xui_awg_client_email) | list | first)
+             | combine({'keepAlive': 25}) }}
+        validate_certs: false
+        status_code: 200
+      when: >-
+        (xui_awg_detail.json.obj.settings.clients
+         | selectattr('email', 'equalto', xui_awg_client_email)
+         | map(attribute='keepAlive') | first | default(0)) | int != 25
+      register: xui_awg_client_keepalive
+      failed_when: not (xui_awg_client_keepalive.json.success | default(false))
       delegate_to: localhost
       become: false
 
@@ -895,24 +925,31 @@
           - xui_awg_vpn_link | length > 0
         fail_msg: "The panel did not return an AmneziaWG connection link for {{ xui_awg_client_email }}."
 
-    # AmneziaVPN scans the vpn:// connection key, not the decoded .conf content.
+    - name: Decode the native AmneziaWG client configuration
+      ansible.builtin.set_fact:
+        xui_awg_conf: >-
+          {{ (xui_awg_vpn_link | regex_replace('^vpn://', '') | regex_replace('-', '+') | regex_replace('_', '/')
+           + ('=' * ((4 - (xui_awg_vpn_link | regex_replace('^vpn://', '') | length % 4)) % 4))) | b64decode }}
+
+    # The panel hardcodes "0.0.0.0/0, ::/0" in the peer block but the tunnel is
+    # IPv4-only; drop the IPv6 route so clients do not black-hole v6 traffic.
+    - name: Restrict the AmneziaWG client profile to IPv4 routing
+      ansible.builtin.set_fact:
+        xui_awg_conf: "{{ xui_awg_conf | regex_replace('AllowedIPs = 0\\.0\\.0\\.0/0, ::/0', 'AllowedIPs = 0.0.0.0/0') }}"
+
+    # The AmneziaWG app imports the raw [Interface]/[Peer] config and rejects
+    # the vpn:// base64 wrapper as an unknown section.
     - name: Generate the local AmneziaWG connection QR code PNG
       ansible.builtin.command:
         argv:
           - qrencode
           - --output
           - "{{ local_xui_dir }}/amneziawg-client.png"
-        stdin: "{{ xui_awg_vpn_link }}"
+        stdin: "{{ xui_awg_conf }}"
         stdin_add_newline: false
       delegate_to: localhost
       become: false
       changed_when: true
-
-    - name: Decode the native AmneziaWG client configuration
-      ansible.builtin.set_fact:
-        xui_awg_conf: >-
-          {{ (xui_awg_vpn_link | regex_replace('^vpn://', '') | regex_replace('-', '+') | regex_replace('_', '/')
-             + ('=' * ((4 - (xui_awg_vpn_link | regex_replace('^vpn://', '') | length % 4)) % 4))) | b64decode }}
 
     - name: Save the AmneziaWG client configuration locally
       ansible.builtin.copy:
