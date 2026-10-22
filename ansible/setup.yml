@@ -348,6 +348,35 @@
       delegate_to: localhost
       become: false
 
+    - name: Read the current self-signed certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+          - -noout
+          - -text
+      register: outline_current_cert
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Remove a certificate issued for a previous hostname
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ local_outline_dir }}/shadowbox-selfsigned.crt"
+        - "{{ local_outline_dir }}/shadowbox-selfsigned.key"
+      when:
+        - outline_current_cert.rc == 0
+        - outline_hostname not in outline_current_cert.stdout
+          or global_vars.xui_panel_hostname not in outline_current_cert.stdout
+      delegate_to: localhost
+      become: false
+
     - name: Generate self-signed certificate
       ansible.builtin.command:
         argv:
@@ -361,6 +390,8 @@
           - rsa:4096
           - -subj
           - "/CN={{ outline_hostname }}"
+          - -addext
+          - "subjectAltName=DNS:{{ outline_hostname }},DNS:{{ global_vars.xui_panel_hostname }}"
           - -keyout
           - "{{ local_outline_dir }}/shadowbox-selfsigned.key"
           - -out
@@ -411,6 +442,7 @@
         owner: root
         group: root
         mode: "0644"
+      notify: Restart shadowbox
 
     - name: Upload TLS key
       ansible.builtin.copy:
@@ -419,6 +451,7 @@
         owner: root
         group: root
         mode: "0600"
+      notify: Restart shadowbox
 
     - name: Write shadowbox server config
       ansible.builtin.copy:
@@ -456,6 +489,9 @@
           SB_API_PREFIX: "{{ outline_api_prefix }}"
           SB_CERTIFICATE_FILE: "{{ outline_state_dir }}/shadowbox-selfsigned.crt"
           SB_PRIVATE_KEY_FILE: "{{ outline_state_dir }}/shadowbox-selfsigned.key"
+
+    - name: Apply pending shadowbox restarts
+      ansible.builtin.meta: flush_handlers
 
     - name: Wait for Outline API to come up
       ansible.builtin.command:
@@ -515,6 +551,15 @@
         content: "{{ (outline_keys_final.stdout | from_json).accessKeys[0].accessUrl }}&prefix={{ global_vars.outline_prefix }}"
       delegate_to: localhost
       become: false
+
+  handlers:
+    - name: Restart shadowbox
+      ansible.builtin.command:
+        argv:
+          - docker
+          - restart
+          - shadowbox
+      changed_when: true
 
 - name: Deploy 3x-ui server
   hosts: ready_server
@@ -616,6 +661,7 @@
         owner: root
         group: root
         mode: "0644"
+      notify: Restart 3x-ui
 
     - name: Upload private key into the 3x-ui cert volume
       ansible.builtin.copy:
@@ -625,6 +671,7 @@
         owner: root
         group: root
         mode: "0600"
+      notify: Restart 3x-ui
 
     - name: Read current 3x-ui panel settings
       community.docker.docker_container_exec:
@@ -875,6 +922,24 @@
       register: xui_awg_detail
       failed_when: not (xui_awg_detail.json.success | default(false))
       changed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Update the AmneziaWG inbound address after a domain change
+      ansible.builtin.uri:
+        url: "{{ xui_api_base }}/inbounds/update/{{ xui_awg_inbound_id }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ xui_api_token }}"
+        body_format: json
+        body: >-
+          {{ xui_awg_detail.json.obj | combine({'shareAddr': global_vars.xui_wg_hostname}) }}
+        validate_certs: false
+        status_code: 200
+      register: xui_awg_addr_update
+      failed_when: not (xui_awg_addr_update.json.success | default(false))
+      changed_when: true
+      when: xui_awg_detail.json.obj.shareAddr != global_vars.xui_wg_hostname
       delegate_to: localhost
       become: false
 
